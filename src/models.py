@@ -16,6 +16,11 @@ try:
         Mamba2Block = None
     try:
         from mamba_ssm import Mamba3 as Mamba3Block
+    except ImportError:
+        try:
+            from mamba_ssm.modules.mamba3 import Mamba3 as Mamba3Block
+        except ImportError:
+            Mamba3Block = None
     except Exception:
         Mamba3Block = None
 except Exception as exc:  # pragma: no cover - exercised only without mamba_ssm
