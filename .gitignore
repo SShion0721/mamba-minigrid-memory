@@ -1,0 +1,31 @@
+# Python virtual environment
+venv/
+venv-mamba-latest/
+
+# Training artifacts
+runs/
+checkpoints/
+videos/
+logs/
+build-*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Checkpoint files (too large for git)
+*.pt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
