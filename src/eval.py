@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from collections import deque
 from types import SimpleNamespace
 
@@ -13,6 +14,11 @@ import torch
 from torch.distributions.categorical import Categorical
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+warnings.filterwarnings(
+    "ignore",
+    message="enable_nested_tensor is True, but self.use_nested_tensor is False.*",
+    category=UserWarning,
+)
 
 from src.envs import make_env
 from src.models import build_actor_critic
@@ -209,6 +215,7 @@ def _checkpoint_config(ckpt) -> SimpleNamespace:
     values.setdefault("env_id", "MiniGrid-MemoryS11-v0")
     values.setdefault("context_len", 64)
     values.setdefault("d_model", 128)
+    values.setdefault("spatial_encoder", "transformer")
     values.setdefault("spatial_layers", 2)
     values.setdefault("spatial_heads", 4)
     values.setdefault("dropout", 0.0)
@@ -220,6 +227,7 @@ def _checkpoint_config(ckpt) -> SimpleNamespace:
     values.setdefault("expand", 2)
     values.setdefault("attention_layers", 2)
     values.setdefault("attention_heads", 4)
+    values.setdefault("valid_actions", "0,1,2")
     return SimpleNamespace(**values)
 
 

@@ -13,8 +13,10 @@ import argparse
 import os
 import sys
 import time
+import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
+from typing import Callable
 
 import numpy as np
 import torch
@@ -23,6 +25,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+warnings.filterwarnings(
+    "ignore",
+    message="enable_nested_tensor is True, but self.use_nested_tensor is False.*",
+    category=UserWarning,
+)
 
 from src.envs import MEMORY_ENVS, make_env
 from src.models import build_actor_critic
@@ -45,6 +52,7 @@ class Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float | None = None
+    ent_coef_final: float = 0.001
 
     num_envs: int = 16
     num_steps: int = 128
@@ -56,6 +64,7 @@ class Config:
     batch_chunks: int = 8
 
     d_model: int = 128
+    spatial_encoder: str = "hybrid"
     spatial_layers: int = 2
     spatial_heads: int = 4
     dropout: float = 0.0
@@ -67,6 +76,7 @@ class Config:
     expand: int = 2
     attention_layers: int = 2
     attention_heads: int = 4
+    valid_actions: str = "0,1,2"
 
     eval_interval: int = 20_000
     eval_episodes: int = 30
@@ -85,6 +95,8 @@ def train(config: Config) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -163,9 +175,19 @@ def train(config: Config) -> None:
     remaining_steps = max(config.total_steps - global_step, config.num_envs * config.num_steps)
     num_updates = max(1, remaining_steps // (config.num_envs * config.num_steps))
     start_time = time.time()
-    next_eval = config.eval_interval
-    next_save = config.save_interval
-    last_pbar_step = global_step
+    initial_global_step = global_step
+    next_eval = _next_interval_boundary(global_step, config.eval_interval)
+    next_save = _next_interval_boundary(global_step, config.save_interval)
+
+    print(
+        "Training config: "
+        f"run={run_name} env={config.env_id} model={config.model}/{config.mamba_variant} "
+        f"steps={global_step}->{config.total_steps} num_envs={config.num_envs} "
+        f"rollout={config.num_steps} context={config.context_len} "
+        f"chunk={config.chunk_len} batch_chunks={config.batch_chunks} "
+        f"spatial={config.spatial_encoder} valid_actions={config.valid_actions}",
+        flush=True,
+    )
 
     with tqdm(
         total=config.total_steps,
@@ -173,15 +195,32 @@ def train(config: Config) -> None:
         desc=f"{config.model}:{config.env_id}",
         unit="step",
         dynamic_ncols=True,
+        mininterval=1.0,
+        smoothing=0.05,
+        file=sys.stdout,
         disable=not config.progress_bar,
+        ascii=True,
     ) as pbar:
         for update in range(num_updates):
+            progress = update / max(num_updates, 1)
+            trainer.ent_coef = config.ent_coef + progress * (config.ent_coef_final - config.ent_coef)
             if config.anneal_lr:
-                frac = 1.0 - update / num_updates
+                frac = 1.0 - progress
                 optimizer.param_groups[0]["lr"] = config.learning_rate * frac
 
             model.train()
             for step in range(config.num_steps):
+                pbar.set_postfix_str(
+                    _progress_status(
+                        phase=f"rollout {step + 1}/{config.num_steps}",
+                        global_step=global_step,
+                        initial_step=initial_global_step,
+                        start_time=start_time,
+                        optimizer=optimizer,
+                        recent_returns=recent_returns,
+                        recent_successes=recent_successes,
+                    )
+                )
                 if config.model in {"mamba", "lstm", "attention"}:
                     context = buffer.get_context(
                         obs_buf,
@@ -258,7 +297,19 @@ def train(config: Config) -> None:
 
                 buffer.step += 1
                 global_step += config.num_envs
+                pbar.update(min(config.num_envs, max(config.total_steps - pbar.n, 0)))
 
+            pbar.set_postfix_str(
+                _progress_status(
+                    phase="bootstrap",
+                    global_step=global_step,
+                    initial_step=initial_global_step,
+                    start_time=start_time,
+                    optimizer=optimizer,
+                    recent_returns=recent_returns,
+                    recent_successes=recent_successes,
+                )
+            )
             next_value = _bootstrap_value(
                 model,
                 config,
@@ -273,40 +324,71 @@ def train(config: Config) -> None:
             buffer.compute_gae(next_value, gamma=config.gamma, gae_lambda=config.gae_lambda)
 
             trainer.global_step = global_step
+            pbar.set_postfix_str(
+                _progress_status(
+                    phase="ppo update 0/?",
+                    global_step=global_step,
+                    initial_step=initial_global_step,
+                    start_time=start_time,
+                    optimizer=optimizer,
+                    recent_returns=recent_returns,
+                    recent_successes=recent_successes,
+                )
+            )
+            def _ppo_progress(done_batches: int, total_batches: int) -> None:
+                pbar.set_postfix_str(
+                    _progress_status(
+                        phase=f"ppo update {done_batches}/{total_batches}",
+                        global_step=global_step,
+                        initial_step=initial_global_step,
+                        start_time=start_time,
+                        optimizer=optimizer,
+                        recent_returns=recent_returns,
+                        recent_successes=recent_successes,
+                    )
+                )
             if config.model in {"mamba", "lstm", "attention"}:
-                trainer.train_sequence(
+                trainer.train_sequence_with_callback(
                     buffer,
                     chunk_len=config.chunk_len,
                     batch_chunks=config.batch_chunks,
                     n_epochs=config.n_epochs,
+                    progress_callback=_ppo_progress,
                 )
             else:
-                trainer.train_feedforward(buffer, batch_size=config.batch_size, n_epochs=config.n_epochs)
+                trainer.train_feedforward_with_callback(
+                    buffer,
+                    batch_size=config.batch_size,
+                    n_epochs=config.n_epochs,
+                    progress_callback=_ppo_progress,
+                )
 
             buffer.reset_rollout()
 
-            pbar.update(max(0, min(global_step, config.total_steps) - last_pbar_step))
-            last_pbar_step = min(global_step, config.total_steps)
-
-            sps = int(global_step / max(time.time() - start_time, 1e-6))
+            sps = (global_step - initial_global_step) / max(time.time() - start_time, 1e-6)
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
             writer.add_scalar("charts/SPS", sps, global_step)
 
             mean_train_return = np.mean(recent_returns) if recent_returns else float("nan")
             mean_train_length = np.mean(recent_lengths) if recent_lengths else float("nan")
             train_success = np.mean(recent_successes) if recent_successes else float("nan")
-            pbar.set_postfix(
-                sps=sps,
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                train_return=f"{mean_train_return:.3f}" if recent_returns else "nan",
-                train_success=f"{train_success:.1%}" if recent_successes else "nan",
+            pbar.set_postfix_str(
+                _progress_status(
+                    phase="ready",
+                    global_step=global_step,
+                    initial_step=initial_global_step,
+                    start_time=start_time,
+                    optimizer=optimizer,
+                    recent_returns=recent_returns,
+                    recent_successes=recent_successes,
+                )
             )
 
             if (update + 1) % config.log_interval == 0 or update == 0:
                 tqdm.write(
                     f"Update {update + 1:>5d}/{num_updates:<5d} | "
                     f"step {global_step:>9d}/{config.total_steps:<9d} | "
-                    f"SPS {sps:>5d} | "
+                    f"SPS {sps:>7.1f} | "
                     f"lr {optimizer.param_groups[0]['lr']:.2e} | "
                     f"train_return {mean_train_return:>7.3f} | "
                     f"train_success {train_success:>6.2%} | "
@@ -314,7 +396,35 @@ def train(config: Config) -> None:
                 )
 
             if global_step >= next_eval:
-                success_rate, mean_return, mean_length = evaluate(model, device, config)
+                def _eval_progress(done_episodes: int, total_episodes: int) -> None:
+                    pbar.set_postfix_str(
+                        _progress_status(
+                            phase=f"eval {done_episodes}/{total_episodes}",
+                            global_step=global_step,
+                            initial_step=initial_global_step,
+                            start_time=start_time,
+                            optimizer=optimizer,
+                            recent_returns=recent_returns,
+                            recent_successes=recent_successes,
+                        )
+                    )
+                pbar.set_postfix_str(
+                    _progress_status(
+                        phase=f"eval 0/{config.eval_episodes}",
+                        global_step=global_step,
+                        initial_step=initial_global_step,
+                        start_time=start_time,
+                        optimizer=optimizer,
+                        recent_returns=recent_returns,
+                        recent_successes=recent_successes,
+                    )
+                )
+                success_rate, mean_return, mean_length = evaluate(
+                    model,
+                    device,
+                    config,
+                    progress_callback=_eval_progress,
+                )
                 writer.add_scalar("eval/success_rate", success_rate, global_step)
                 writer.add_scalar("eval/mean_return", mean_return, global_step)
                 writer.add_scalar("eval/mean_length", mean_length, global_step)
@@ -328,6 +438,17 @@ def train(config: Config) -> None:
                 next_eval += config.eval_interval
 
             if global_step >= next_save:
+                pbar.set_postfix_str(
+                    _progress_status(
+                        phase="save",
+                        global_step=global_step,
+                        initial_step=initial_global_step,
+                        start_time=start_time,
+                        optimizer=optimizer,
+                        recent_returns=recent_returns,
+                        recent_successes=recent_successes,
+                    )
+                )
                 ckpt_path = os.path.join(run_dir, f"model_{global_step}.pt")
                 _save_checkpoint(ckpt_path, model, optimizer, config, global_step, action_dim)
                 latest_path = os.path.join(run_dir, "model_latest.pt")
@@ -346,7 +467,12 @@ def train(config: Config) -> None:
     writer.close()
 
 
-def evaluate(model, device: torch.device, config: Config) -> tuple[float, float, float]:
+def evaluate(
+    model,
+    device: torch.device,
+    config: Config,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[float, float, float]:
     """Evaluate with greedy actions."""
 
     model.eval()
@@ -419,6 +545,8 @@ def evaluate(model, device: torch.device, config: Config) -> tuple[float, float,
         total_length += ep_len
         successes += int(last_reward > 0)
         env.close()
+        if progress_callback is not None:
+            progress_callback(episode + 1, config.eval_episodes)
 
     model.train()
     return (
@@ -541,6 +669,32 @@ def _format_config(config: Config) -> str:
     return "\n".join(f"{key}: {value}" for key, value in asdict(config).items())
 
 
+def _next_interval_boundary(current_step: int, interval: int) -> int:
+    if interval <= 0:
+        return sys.maxsize
+    return ((current_step // interval) + 1) * interval
+
+
+def _progress_status(
+    *,
+    phase: str,
+    global_step: int,
+    initial_step: int,
+    start_time: float,
+    optimizer: torch.optim.Optimizer,
+    recent_returns: deque,
+    recent_successes: deque,
+) -> str:
+    elapsed = max(time.time() - start_time, 1e-6)
+    sps = (global_step - initial_step) / elapsed
+    mean_return = np.mean(recent_returns) if recent_returns else float("nan")
+    success = np.mean(recent_successes) if recent_successes else float("nan")
+    return (
+        f"{phase} | sps={sps:.1f} | lr={optimizer.param_groups[0]['lr']:.2e} | "
+        f"return={mean_return:.3f} | success={success:.1%}"
+    )
+
+
 def parse_args(default_model: str = "mamba") -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-id", type=str, default="MiniGrid-MemoryS11-v0")
@@ -554,6 +708,7 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef-final", type=float, default=0.001)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=None)
@@ -565,6 +720,7 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--chunk-len", type=int, default=64)
     parser.add_argument("--batch-chunks", type=int, default=8)
     parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--spatial-encoder", type=str, default="hybrid", choices=["hybrid", "transformer"])
     parser.add_argument("--spatial-layers", type=int, default=2)
     parser.add_argument("--spatial-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -576,6 +732,12 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--expand", type=int, default=2)
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument(
+        "--valid-actions",
+        type=str,
+        default="0,1,2",
+        help="Comma-separated action ids kept in the policy distribution; MiniGrid Memory needs left,right,forward.",
+    )
     parser.add_argument("--eval-interval", type=int, default=20_000)
     parser.add_argument("--eval-episodes", type=int, default=30)
     parser.add_argument("--save-interval", type=int, default=100_000)
@@ -597,6 +759,7 @@ def parse_args(default_model: str = "mamba") -> Config:
         gae_lambda=args.gae_lambda,
         clip_coef=args.clip_coef,
         ent_coef=args.ent_coef,
+        ent_coef_final=args.ent_coef_final,
         vf_coef=args.vf_coef,
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
@@ -608,6 +771,7 @@ def parse_args(default_model: str = "mamba") -> Config:
         chunk_len=args.chunk_len,
         batch_chunks=args.batch_chunks,
         d_model=args.d_model,
+        spatial_encoder=args.spatial_encoder,
         spatial_layers=args.spatial_layers,
         spatial_heads=args.spatial_heads,
         dropout=args.dropout,
@@ -619,6 +783,7 @@ def parse_args(default_model: str = "mamba") -> Config:
         expand=args.expand,
         attention_layers=args.attention_layers,
         attention_heads=args.attention_heads,
+        valid_actions=args.valid_actions,
         eval_interval=args.eval_interval,
         eval_episodes=args.eval_episodes,
         save_interval=args.save_interval,

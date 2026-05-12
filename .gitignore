@@ -8,6 +8,7 @@ checkpoints/
 videos/
 logs/
 build-*.log
+.triton_cache/
 
 # Python cache
 __pycache__/
