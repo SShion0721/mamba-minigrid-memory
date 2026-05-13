@@ -210,8 +210,7 @@ def train(config: Config) -> None:
             progress = update / max(num_updates, 1)
             trainer.ent_coef = config.ent_coef + progress * (config.ent_coef_final - config.ent_coef)
             if config.anneal_lr:
-                frac = 1.0 - progress
-                optimizer.param_groups[0]["lr"] = config.learning_rate * frac
+                scheduler.step()
 
             model.train()
             for step in range(config.num_steps):
