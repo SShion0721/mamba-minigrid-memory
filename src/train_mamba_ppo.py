@@ -53,6 +53,8 @@ class Config:
     max_grad_norm: float = 0.5
     target_kl: float | None = None
     ent_coef_final: float = 0.001
+    spinning_penalty: float = 0.0
+    spinning_threshold: int = 10
 
     num_envs: int = 16
     num_steps: int = 128
@@ -109,27 +111,42 @@ def train(config: Config) -> None:
     writer = SummaryWriter(run_dir)
     writer.add_text("config", _format_config(config), 0)
 
-    envs = [make_env(config.env_id, seed=config.seed + i) for i in range(config.num_envs)]
+    global_step = 0
+    if config.resume_from:
+        ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)
+        global_step = int(ckpt.get("global_step", 0))
+        print(f"Resumed checkpoint {config.resume_from} at global_step={global_step}")
+
+    envs = [
+        make_env(
+            config.env_id,
+            seed=config.seed + i,
+            spinning_penalty=config.spinning_penalty,
+            spinning_threshold=config.spinning_threshold,
+        )
+        for i in range(config.num_envs)
+    ]
 
     first_obs, _ = envs[0].reset(seed=config.seed)
     obs_shape = first_obs["obs"].shape
     action_dim = envs[0].action_space.n
 
     model = build_actor_critic(config, action_dim=action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
-    scheduler = lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=config.total_steps // config.batch_size, # 你的总更新次数
-        eta_min=1e-10  # 降到最低是多少
-    )
-    global_step = 0
     if config.resume_from:
-        ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)
+        # ckpt already loaded above for global_step
         model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        global_step = int(ckpt.get("global_step", 0))
-        print(f"Resumed checkpoint {config.resume_from} at global_step={global_step}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
+    if config.resume_from and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    remaining_steps = max(config.total_steps - global_step, config.num_envs * config.num_steps)
+    num_updates = max(1, remaining_steps // (config.num_envs * config.num_steps))
+    scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_updates,
+        eta_min=1e-10,
+    )
 
     trainer = PPOTrainer(
         model=model,
@@ -484,7 +501,12 @@ def evaluate(
     total_length = 0
 
     for episode in range(config.eval_episodes):
-        env = make_env(config.env_id, seed=config.seed + 10_000 + episode)
+        env = make_env(
+            config.env_id,
+            seed=config.seed + 10_000 + episode,
+            spinning_penalty=config.spinning_penalty,
+            spinning_threshold=config.spinning_threshold,
+        )
         obs_dict, _ = env.reset(seed=config.seed + 10_000 + episode)
         obs = obs_dict["obs"]
         direction = obs_dict["direction"]
@@ -715,6 +737,8 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=None)
+    parser.add_argument("--spinning-penalty", type=float, default=0.0, help="Penalty per step for staying in the same cell")
+    parser.add_argument("--spinning-threshold", type=int, default=10, help="Max steps allowed in the same cell before penalty")
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -766,6 +790,8 @@ def parse_args(default_model: str = "mamba") -> Config:
         vf_coef=args.vf_coef,
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
+        spinning_penalty=args.spinning_penalty,
+        spinning_threshold=args.spinning_threshold,
         num_envs=args.num_envs,
         num_steps=args.num_steps,
         batch_size=args.batch_size,
