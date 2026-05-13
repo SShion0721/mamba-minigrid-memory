@@ -209,8 +209,7 @@ def train(config: Config) -> None:
         for update in range(num_updates):
             progress = update / max(num_updates, 1)
             trainer.ent_coef = config.ent_coef + progress * (config.ent_coef_final - config.ent_coef)
-            if config.anneal_lr:
-                scheduler.step()
+            scheduler.step()
 
             model.train()
             for step in range(config.num_steps):
