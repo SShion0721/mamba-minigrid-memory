@@ -17,7 +17,7 @@ import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Callable
-
+import torch.optim.lr_scheduler as lr_scheduler
 import numpy as np
 import torch
 from torch.distributions.categorical import Categorical
@@ -117,6 +117,11 @@ def train(config: Config) -> None:
 
     model = build_actor_critic(config, action_dim=action_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
+    scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.total_steps // config.batch_size, # 你的总更新次数
+        eta_min=1e-10  # 降到最低是多少
+    )
     global_step = 0
     if config.resume_from:
         ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)

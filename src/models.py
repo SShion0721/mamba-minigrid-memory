@@ -39,6 +39,18 @@ def layer_init(layer: nn.Linear, std: float = 1.0, bias_const: float = 0.0) -> n
     return layer
 
 
+def _safe_categorical(logits: torch.Tensor) -> Categorical:
+    """Create a Categorical distribution with NaN/Inf-safe logits.
+
+    Mamba blocks can occasionally produce NaN due to numerical instability.
+    This helper replaces NaN with a very large negative value (effectively
+    zero probability) and clamps extreme values to prevent overflow.
+    """
+    safe = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+    safe = safe.clamp(-1e9, 1e9)
+    return Categorical(logits=safe)
+
+
 class MiniGridSpatialEncoder(nn.Module):
     """Encode a 7x7 semantic MiniGrid view.
 
@@ -293,7 +305,7 @@ class MLPActorCritic(nn.Module):
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, value = self.forward(obs, direction, prev_action, prev_reward, episode_start)
-        dist = Categorical(logits=logits)
+        dist = _safe_categorical(logits)
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value
@@ -357,7 +369,7 @@ class LSTMActorCritic(nn.Module):
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
-        dist = Categorical(logits=logits[:, -1])
+        dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), values[:, -1]
@@ -425,7 +437,7 @@ class MambaActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
         for block in self.blocks:
-            x = x + block(x)
+            x = x + torch.nan_to_num(block(x), nan=0.0)
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
@@ -439,7 +451,7 @@ class MambaActorCritic(nn.Module):
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
-        dist = Categorical(logits=logits[:, -1])
+        dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), values[:, -1]
@@ -517,7 +529,7 @@ class AttentionActorCritic(nn.Module):
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
-        dist = Categorical(logits=logits[:, -1])
+        dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), values[:, -1]

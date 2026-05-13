@@ -11,6 +11,8 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+from src.models import _safe_categorical
+
 
 class RolloutBuffer:
     """Fixed-length rollout buffer with per-env context history."""
@@ -322,7 +324,7 @@ class PPOTrainer:
                     torch.as_tensor(prev_rew_seq, device=self.device),
                     torch.as_tensor(ep_start_seq, device=self.device),
                 )
-                dist = Categorical(logits=logits)
+                dist = _safe_categorical(logits)
                 new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
                 entropy = dist.entropy()
 
