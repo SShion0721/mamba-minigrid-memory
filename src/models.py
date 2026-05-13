@@ -453,10 +453,10 @@ class MambaActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
         for norm, block in zip(self.block_norms, self.blocks):
-            h = norm(x) # 归一化输入，减少数值溢出
-        out = block(h)
-        out = torch.clamp(out, min=-10.0, max=10.0) # 保留梯度
-        x = x + out
+            h = norm(x)  # 归一化输入，减少数值溢出
+            out = block(h)
+            out = torch.clamp(out, min=-10.0, max=10.0)  # 保留梯度
+            x = x + out
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
         # for block in self.blocks:
