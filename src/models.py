@@ -223,6 +223,12 @@ class TokenEncoder(nn.Module):
         self.reward_proj = layer_init(nn.Linear(1, d_model))
         self.start_proj = layer_init(nn.Linear(1, d_model))
         self.token_norm = nn.LayerNorm(d_model)
+        #  episode_start 门控
+        self.start_gate = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.Sigmoid(),
+        )
+        # 设计思路：当 episode_start=1 时，gate 接近 1，token 主要由 start_proj 提供，重置记忆；当 episode_start=0 时，gate 接近 0，token 主要由 obs_encoder 和 action/reward 投影提供，正常记忆更新。
 
     def forward(
         self,
@@ -233,13 +239,20 @@ class TokenEncoder(nn.Module):
         episode_start_seq: torch.Tensor,
     ) -> torch.Tensor:
         x = self.obs_encoder(obs_seq, direction_seq)
-        x = (
-            x
-            + self.action_proj(prev_action_seq.float())
-            + self.reward_proj(prev_reward_seq.float())
-            + self.start_proj(episode_start_seq.float())
-        )
+        
+        x = x + self.action_proj(prev_action_seq.float())
+        x = x + self.reward_proj(prev_reward_seq.float())
+        # 使用门控而非简单相加
+        gate = self.start_gate(episode_start_seq.float())
+        x = x * (1 - gate) + self.start_proj(episode_start_seq.float()) * gate
         return self.token_norm(x)
+        # x = (
+        #     x
+        #     + self.action_proj(prev_action_seq.float())
+        #     + self.reward_proj(prev_reward_seq.float())
+        #     + self.start_proj(episode_start_seq.float())
+        # )
+        # return self.token_norm(x)
 
 
 class MLPActorCritic(nn.Module):
@@ -423,9 +436,12 @@ class MambaActorCritic(nn.Module):
                 for _ in range(n_layers)
             ]
         )
+        self.block_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+
+        #增加mamba梯度稳定性：在每个block输出后添加残差连接和LayerNorm，并在输出前对block输出进行clamp，防止数值过大导致NaN。
 
     def forward(
         self,
@@ -436,10 +452,17 @@ class MambaActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
-        for block in self.blocks:
-            x = x + torch.nan_to_num(block(x), nan=0.0)
+        for norm, block in zip(self.block_norms, self.blocks):
+            h = norm(x) # 归一化输入，减少数值溢出
+        out = block(h)
+        out = torch.clamp(out, min=-10.0, max=10.0) # 保留梯度
+        x = x + out
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        # for block in self.blocks:
+        #     x = x + torch.nan_to_num(block(x), nan=0.0)
+        # x = self.norm(x)
+        # return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def get_action_and_value(
         self,

@@ -145,7 +145,7 @@ def train(config: Config) -> None:
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=num_updates,
-        eta_min=1e-10,
+        eta_min=1e-6,
     )
 
     trainer = PPOTrainer(
