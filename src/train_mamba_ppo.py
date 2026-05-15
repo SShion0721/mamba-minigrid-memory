@@ -228,7 +228,6 @@ def train(config: Config) -> None:
         for update in range(num_updates):
             progress = update / max(num_updates, 1)
             trainer.ent_coef = config.ent_coef + progress * (config.ent_coef_final - config.ent_coef)
-            scheduler.step()
 
             model.train()
             for step in range(config.num_steps):
@@ -386,6 +385,7 @@ def train(config: Config) -> None:
                 )
 
             buffer.reset_rollout()
+            scheduler.step()
 
             sps = (global_step - initial_global_step) / max(time.time() - start_time, 1e-6)
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
