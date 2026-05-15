@@ -378,14 +378,7 @@ class PPOTrainer:
         pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
         pg_loss = reduce_loss(torch.max(pg_loss1, pg_loss2))
 
-        value_pred_clipped = old_values + torch.clamp(
-            new_value - old_values,
-            -self.clip_coef,
-            self.clip_coef,
-        )
-        value_losses = (new_value - returns) ** 2
-        value_losses_clipped = (value_pred_clipped - returns) ** 2
-        value_loss = 0.5 * reduce_loss(torch.max(value_losses, value_losses_clipped))
+        value_loss = 0.5 * reduce_loss((new_value - returns) ** 2)
 
         entropy_loss = reduce_loss(entropy)
         loss = pg_loss - self.ent_coef * entropy_loss + self.vf_coef * value_loss

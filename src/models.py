@@ -255,6 +255,75 @@ class TokenEncoder(nn.Module):
         # return self.token_norm(x)
 
 
+class GRUGate(nn.Module):
+    """用于强化学习 Transformer 的门控机制 (Stabilizing RL Transformers)"""
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.linear_w_r = nn.Linear(d_model, d_model, bias=False)
+        self.linear_u_r = nn.Linear(d_model, d_model, bias=False)
+        self.linear_w_z = nn.Linear(d_model, d_model, bias=False)
+        self.linear_u_z = nn.Linear(d_model, d_model, bias=False)
+        self.linear_w_g = nn.Linear(d_model, d_model, bias=False)
+        self.linear_u_g = nn.Linear(d_model, d_model, bias=False)
+        self.bias_r = nn.Parameter(torch.zeros(d_model))
+        self.bias_z = nn.Parameter(torch.zeros(d_model))
+        self.bias_g = nn.Parameter(torch.zeros(d_model))
+        
+        # 将 z (update gate) 的偏置初始化为较大的负数，
+        # 这确保了网络初始化时几乎是 Identity Mapping (x_new ≈ x_old)，这对 PPO 极度重要！
+        nn.init.constant_(self.bias_z, -2.0)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # x: prev_state (残差连接), y: new_info (如 attention 输出)
+        r = torch.sigmoid(self.linear_w_r(y) + self.linear_u_r(x) + self.bias_r)
+        z = torch.sigmoid(self.linear_w_z(y) + self.linear_u_z(x) + self.bias_z)
+        g = torch.tanh(self.linear_w_g(y) + self.linear_u_g(r * x) + self.bias_g)
+        return (1.0 - z) * x + z * g
+
+
+class GatedAttentionBlock(nn.Module):
+    """结合 FlashAttention 和 GRU 门控的 Block"""
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.gate1 = GRUGate(d_model)
+        
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            layer_init(nn.Linear(d_model, 4 * d_model)),
+            nn.GELU(),
+            layer_init(nn.Linear(4 * d_model, d_model))
+        )
+        self.gate2 = GRUGate(d_model)
+        self.n_heads = n_heads
+
+    def forward(self, x: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+        # 1. 快速注意力计算
+        B, T, C = x.shape
+        qkv = self.qkv(self.norm1(x))
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        
+        # 调用 PyTorch 原生的高效 SDPA (底层自动使用 FlashAttention)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
+        attn_out = self.out_proj(attn_out)
+        
+        # 使用 GRU 门控替代原来的简单残差 x = x + attn_out
+        x = self.gate1(x, attn_out)
+        
+        # 2. MLP 层
+        mlp_out = self.mlp(self.norm2(x))
+        x = self.gate2(x, mlp_out)
+        
+        return x
+    
+
 class MLPActorCritic(nn.Module):
     """Feedforward PPO baseline with spatial attention but no temporal memory."""
 
@@ -480,6 +549,71 @@ class MambaActorCritic(nn.Module):
         return action, dist.log_prob(action), dist.entropy(), values[:, -1]
 
 
+class FastGatedAttentionActorCritic(nn.Module):
+    """Gated Causal Attention Actor Critic for RL"""
+    def __init__(
+        self,
+        action_dim: int = 7,
+        d_model: int = 128,
+        n_layers: int = 2,     
+        n_heads: int = 4,
+        context_len: int = 128,
+        spatial_layers: int = 2,
+        spatial_heads: int = 4,
+        dropout: float = 0.0,
+        valid_actions: list[int] | None = None,
+        spatial_encoder: str = "hybrid",
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        _register_action_mask(self, action_dim, valid_actions)
+        self.context_len = context_len
+        
+        self.token_encoder = TokenEncoder(
+            action_dim=action_dim, d_model=d_model, spatial_layers=spatial_layers,
+            spatial_heads=spatial_heads, dropout=dropout, spatial_encoder=spatial_encoder,
+        )
+        
+        # 绝对位置编码 (对于 128 长度已经足够)
+        self.temporal_pos = nn.Parameter(torch.zeros(1, context_len, d_model))
+        nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+        
+        # Gated Attention Blocks
+        self.blocks = nn.ModuleList([
+            GatedAttentionBlock(d_model=d_model, n_heads=n_heads)
+            for _ in range(n_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+        self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+
+    def forward(
+        self, obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        seq_len = x.shape[1]
+        
+        if seq_len > self.context_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds context_len {self.context_len}.")
+            
+        x = x + self.temporal_pos[:, -seq_len:]
+        
+        # 前向传播过 Gated Blocks
+        for block in self.blocks:
+            x = block(x, is_causal=True)
+            
+        x = self.norm(x)
+        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+
+    def get_action_and_value(self, obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, action=None):
+        logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        dist = _safe_categorical(logits[:, -1])
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+    
 class AttentionActorCritic(nn.Module):
     """Spatial-attention + causal temporal-attention actor critic."""
 
@@ -619,6 +753,20 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
         )
+    if model_name == "gated_attention":
+        return FastGatedAttentionActorCritic(
+            action_dim=action_dim,
+            d_model=d_model,
+            n_layers=getattr(cfg, "attention_layers", 2),
+            n_heads=getattr(cfg, "attention_heads", 4),
+            context_len=getattr(cfg, "context_len", 128),
+            spatial_layers=spatial_layers,
+            spatial_heads=spatial_heads,
+            dropout=dropout,
+            valid_actions=valid_actions,
+            spatial_encoder=spatial_encoder,
+        )
+    
 
     raise ValueError(f"Unknown model type: {model_name}")
 

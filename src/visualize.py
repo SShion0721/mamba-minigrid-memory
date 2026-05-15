@@ -82,7 +82,7 @@ def record_episodes(
         print(f"\nEpisode {episode + 1}/{num_episodes}")
 
         while not done:
-            if cfg.model in {"mamba", "lstm", "attention"}:
+            if cfg.model in {"mamba", "lstm", "attention", "gated_attention"}:
                 obs_ctx.append(obs)
                 dir_ctx.append(direction)
                 act_ctx.append(prev_action)
@@ -220,18 +220,18 @@ def _checkpoint_config(ckpt) -> SimpleNamespace:
     else:
         values = dict(getattr(cfg_raw, "__dict__", {}))
 
-    values.setdefault("model", "mamba")
-    values.setdefault("env_id", "MiniGrid-MemoryS11-v0")
-    values.setdefault("context_len", 64)
+    values.setdefault("model", "lstm")
+    values.setdefault("env_id", "MiniGrid-MemoryS13-v0")
+    values.setdefault("context_len", 128)
     values.setdefault("d_model", 128)
-    values.setdefault("spatial_encoder", "transformer")
+    values.setdefault("spatial_encoder", "hybrid")
     values.setdefault("spatial_layers", 2)
     values.setdefault("spatial_heads", 4)
     values.setdefault("dropout", 0.0)
     values.setdefault("lstm_layers", 1)
     values.setdefault("mamba_variant", "mamba")
     values.setdefault("mamba_layers", 2)
-    values.setdefault("d_state", 16)
+    values.setdefault("d_state", 32)
     values.setdefault("d_conv", 4)
     values.setdefault("expand", 2)
     values.setdefault("attention_layers", 2)
