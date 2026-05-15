@@ -35,6 +35,8 @@ from src.envs import MEMORY_ENVS, make_env
 from src.models import build_actor_critic
 from src.ppo import PPOTrainer, RolloutBuffer
 
+SEQUENCE_MODELS = {"mamba", "lstm", "attention", "gated_attention"}
+
 
 @dataclass
 class Config:
@@ -61,7 +63,7 @@ class Config:
     batch_size: int = 256
     n_epochs: int = 4
 
-    context_len: int = 64
+    context_len: int = 128
     chunk_len: int = 64
     batch_chunks: int = 8
 
@@ -92,7 +94,7 @@ class Config:
 def train(config: Config) -> None:
     if config.env_id not in MEMORY_ENVS and "Memory" in config.env_id:
         print(f"Warning: {config.env_id} is not in the known Memory env list.")
-    if config.model in {"mamba", "lstm", "attention"} and config.chunk_len > config.num_steps:
+    if config.model in SEQUENCE_MODELS and config.chunk_len > config.num_steps:
         raise ValueError("--chunk-len must be <= --num-steps for sequence models.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -241,7 +243,7 @@ def train(config: Config) -> None:
                         recent_successes=recent_successes,
                     )
                 )
-                if config.model in {"mamba", "lstm", "attention"}:
+                if config.model in SEQUENCE_MODELS:
                     context = buffer.get_context(
                         obs_buf,
                         direction_buf,
@@ -367,7 +369,7 @@ def train(config: Config) -> None:
                         recent_successes=recent_successes,
                     )
                 )
-            if config.model in {"mamba", "lstm", "attention"}:
+            if config.model in SEQUENCE_MODELS:
                 trainer.train_sequence_with_callback(
                     buffer,
                     chunk_len=config.chunk_len,
@@ -526,7 +528,7 @@ def evaluate(
         last_reward = 0.0
 
         while not done:
-            if config.model in {"mamba", "lstm", "attention"}:
+            if config.model in SEQUENCE_MODELS:
                 obs_ctx.append(obs)
                 dir_ctx.append(direction)
                 act_ctx.append(prev_action)
@@ -593,7 +595,7 @@ def _bootstrap_value(
     episode_start_buf: np.ndarray,
 ) -> np.ndarray:
     with torch.no_grad():
-        if config.model in {"mamba", "lstm", "attention"}:
+        if config.model in SEQUENCE_MODELS:
             context = buffer.get_context(obs_buf, direction_buf, prev_action_buf, prev_reward_buf, episode_start_buf)
             _, values = model.forward(
                 torch.as_tensor(context[0], device=device),
@@ -723,7 +725,7 @@ def _progress_status(
 def parse_args(default_model: str = "mamba") -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-id", type=str, default="MiniGrid-MemoryS11-v0")
-    parser.add_argument("--model", type=str, default=default_model, choices=["mamba", "attention", "lstm", "mlp"])
+    parser.add_argument("--model", type=str, default=default_model, choices=["mamba", "attention", "lstm", "mlp", "gated_attention"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--lr", type=float, default=2.5e-4)
@@ -743,7 +745,7 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-epochs", type=int, default=4)
-    parser.add_argument("--context-len", type=int, default=64)
+    parser.add_argument("--context-len", type=int, default=128)
     parser.add_argument("--chunk-len", type=int, default=64)
     parser.add_argument("--batch-chunks", type=int, default=8)
     parser.add_argument("--d-model", type=int, default=128)
