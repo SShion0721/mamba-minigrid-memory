@@ -395,6 +395,7 @@ class PPOTrainer:
                     adv_seq,
                     ret_seq,
                     old_value_seq,
+                    valid_mask,
                     loss_mask,
                 ) = _pack_sequence_batch(buffer, selected, advantages, chunk_len, burn_in_len)
 
@@ -405,6 +406,7 @@ class PPOTrainer:
                         torch.as_tensor(prev_act_seq, device=self.device),
                         torch.as_tensor(prev_rew_seq, device=self.device),
                         torch.as_tensor(ep_start_seq, device=self.device),
+                        valid_mask=torch.as_tensor(valid_mask, device=self.device),
                     )
                     dist = _safe_categorical(logits)
                     new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
@@ -583,6 +585,7 @@ def _pack_sequence_batch(
     adv_seq = np.zeros((batch_size, sequence_len), dtype=advantages.dtype)
     ret_seq = np.zeros((batch_size, sequence_len), dtype=buffer.returns.dtype)
     old_value_seq = np.zeros((batch_size, sequence_len), dtype=buffer.values.dtype)
+    valid_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
     loss_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
 
     for batch_idx, (env_idx, segment_start, start, end) in enumerate(selected):
@@ -593,7 +596,8 @@ def _pack_sequence_batch(
         target_length = end - start
         if sequence_length <= 0 or target_length <= 0:
             continue
-        dest = slice(0, sequence_length)
+        offset = sequence_len - sequence_length
+        dest = slice(offset, offset + sequence_length)
         src = slice(burn_start, sequence_end)
         obs_seq[batch_idx, dest] = buffer.observations[src, env_idx]
         dir_seq[batch_idx, dest] = buffer.directions[src, env_idx]
@@ -605,7 +609,9 @@ def _pack_sequence_batch(
         adv_seq[batch_idx, dest] = advantages[src, env_idx]
         ret_seq[batch_idx, dest] = buffer.returns[src, env_idx]
         old_value_seq[batch_idx, dest] = buffer.values[src, env_idx]
-        loss_mask[batch_idx, target_start : target_start + target_length] = 1.0
+        valid_mask[batch_idx, dest] = 1.0
+        loss_start = offset + target_start
+        loss_mask[batch_idx, loss_start : loss_start + target_length] = 1.0
 
     return (
         obs_seq,
@@ -618,5 +624,6 @@ def _pack_sequence_batch(
         adv_seq,
         ret_seq,
         old_value_seq,
+        valid_mask,
         loss_mask,
     )

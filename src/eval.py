@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.distributions.categorical import Categorical
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings(
@@ -21,7 +20,7 @@ warnings.filterwarnings(
 )
 
 from src.envs import make_env
-from src.models import build_actor_critic
+from src.models import _safe_categorical, build_actor_critic
 
 
 class Config(SimpleNamespace):
@@ -104,9 +103,10 @@ def evaluate(
                         torch.as_tensor(episode_start, device=device).unsqueeze(0),
                     )
                     if deterministic:
-                        action = torch.argmax(logits, dim=-1).item()
+                        safe_logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                        action = torch.argmax(safe_logits, dim=-1).item()
                     else:
-                        action = Categorical(logits=logits).sample().item()
+                        action = _safe_categorical(logits).sample().item()
 
             obs_dict, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -176,8 +176,9 @@ def _sequence_action(
         )
         last_logits = logits[:, -1]
         if deterministic:
-            return torch.argmax(last_logits, dim=-1).item()
-        return Categorical(logits=last_logits).sample().item()
+            safe_logits = torch.nan_to_num(last_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+            return torch.argmax(safe_logits, dim=-1).item()
+        return _safe_categorical(last_logits).sample().item()
 
 
 def _pack_context(

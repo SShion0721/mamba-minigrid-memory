@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.distributions.categorical import Categorical
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings(
@@ -21,7 +20,7 @@ warnings.filterwarnings(
 )
 
 from src.envs import make_env
-from src.models import build_actor_critic
+from src.models import _safe_categorical, build_actor_critic
 
 
 ACTION_NAMES = ["left", "right", "forward", "pickup", "drop", "toggle", "done"]
@@ -111,11 +110,12 @@ def record_episodes(
                         torch.as_tensor(prev_reward, device=device).unsqueeze(0),
                         torch.as_tensor(episode_start, device=device).unsqueeze(0),
                     )
-                    probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                    safe_logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                    probs = torch.softmax(safe_logits, dim=-1).cpu().numpy()[0]
                     if deterministic:
-                        action = torch.argmax(logits, dim=-1).item()
+                        action = torch.argmax(safe_logits, dim=-1).item()
                     else:
-                        action = Categorical(logits=logits).sample().item()
+                        action = _safe_categorical(logits).sample().item()
 
             obs_dict, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -181,11 +181,12 @@ def _sequence_action(
             torch.as_tensor(start_seq, device=device),
         )
         last_logits = logits[:, -1]
-        probs = torch.softmax(last_logits, dim=-1).cpu().numpy()[0]
+        safe_logits = torch.nan_to_num(last_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+        probs = torch.softmax(safe_logits, dim=-1).cpu().numpy()[0]
         if deterministic:
-            action = torch.argmax(last_logits, dim=-1).item()
+            action = torch.argmax(safe_logits, dim=-1).item()
         else:
-            action = Categorical(logits=last_logits).sample().item()
+            action = _safe_categorical(last_logits).sample().item()
     return action, probs
 
 

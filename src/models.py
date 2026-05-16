@@ -232,6 +232,7 @@ class TokenEncoder(nn.Module):
         prev_action_seq: torch.Tensor,
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = (
             self.obs_encoder(obs_seq, direction_seq)
@@ -239,7 +240,8 @@ class TokenEncoder(nn.Module):
             + self.reward_proj(prev_reward_seq.float())
             + self.start_proj(episode_start_seq.float())
         )
-        return self.token_norm(x)
+        x = self.token_norm(x)
+        return _apply_valid_mask(x, valid_mask)
 
 
 class GRUGate(nn.Module):
@@ -295,6 +297,7 @@ class GatedAttentionBlock(nn.Module):
         *,
         is_causal: bool = True,
         alibi_slopes: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # 1. 快速注意力计算
         B, T, C = x.shape
@@ -310,6 +313,12 @@ class GatedAttentionBlock(nn.Module):
         if alibi_slopes is not None:
             attn_mask = _alibi_attention_mask(T, alibi_slopes, q.device, q.dtype, causal=is_causal)
             is_causal = False
+        if valid_mask is not None:
+            pad_bias = _padding_attention_bias(valid_mask, q.device, q.dtype)
+            if attn_mask is None:
+                attn_mask = _causal_attention_bias(T, q.device, q.dtype) if is_causal else 0.0
+            attn_mask = attn_mask + pad_bias
+            is_causal = False
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
         attn_out = self.out_proj(attn_out)
@@ -321,7 +330,7 @@ class GatedAttentionBlock(nn.Module):
         mlp_out = self.mlp(self.norm2(x))
         x = self.gate2(x, mlp_out)
         
-        return x
+        return _apply_valid_mask(torch.nan_to_num(x), valid_mask)
 
     def forward_step(
         self,
@@ -482,8 +491,9 @@ class LSTMActorCritic(nn.Module):
         prev_action_seq: torch.Tensor,
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
         x, _ = self.lstm(x)
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
@@ -496,8 +506,16 @@ class LSTMActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        logits, values = self.forward(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask=valid_mask,
+        )
         dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
@@ -580,8 +598,9 @@ class MambaActorCritic(nn.Module):
         prev_action_seq: torch.Tensor,
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
         for norm, block in zip(self.block_norms, self.blocks):
             out = block(norm(x))
             _raise_if_nonfinite(out, "Mamba block output")
@@ -660,8 +679,16 @@ class MambaActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        logits, values = self.forward(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask=valid_mask,
+        )
         dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
@@ -720,10 +747,16 @@ class FastGatedAttentionActorCritic(nn.Module):
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
 
     def forward(
-        self, obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq
+        self,
+        obs_seq,
+        direction_seq,
+        prev_action_seq,
+        prev_reward_seq,
+        episode_start_seq,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
         seq_len = x.shape[1]
         
         if seq_len > self.context_len:
@@ -731,16 +764,34 @@ class FastGatedAttentionActorCritic(nn.Module):
             
         if self.temporal_pos is not None:
             x = x + self.temporal_pos[:, -seq_len:]
+            x = _apply_valid_mask(x, valid_mask)
         
         # 前向传播过 Gated Blocks
         for block in self.blocks:
-            x = block(x, is_causal=True, alibi_slopes=self.alibi_slopes)
+            x = block(x, is_causal=True, alibi_slopes=self.alibi_slopes, valid_mask=valid_mask)
             
         x = self.norm(x)
+        x = _apply_valid_mask(x, valid_mask)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
-    def get_action_and_value(self, obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, action=None):
-        logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+    def get_action_and_value(
+        self,
+        obs_seq,
+        direction_seq,
+        prev_action_seq,
+        prev_reward_seq,
+        episode_start_seq,
+        action=None,
+        valid_mask: torch.Tensor | None = None,
+    ):
+        logits, values = self.forward(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask=valid_mask,
+        )
         dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
@@ -835,6 +886,7 @@ class AttentionActorCritic(nn.Module):
         self.action_dim = action_dim
         _register_action_mask(self, action_dim, valid_actions)
         self.context_len = context_len
+        self.n_heads = n_heads
         self.token_encoder = TokenEncoder(
             action_dim=action_dim,
             d_model=d_model,
@@ -866,15 +918,21 @@ class AttentionActorCritic(nn.Module):
         prev_action_seq: torch.Tensor,
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
         seq_len = x.shape[1]
         if seq_len > self.context_len:
             raise ValueError(f"Sequence length {seq_len} exceeds context_len {self.context_len}.")
         x = x + self.temporal_pos[:, -seq_len:]
-        mask = _causal_mask(seq_len, x.device)
+        x = _apply_valid_mask(x, valid_mask)
+        mask = _temporal_attention_mask(valid_mask, seq_len, self.n_heads, x.device, x.dtype)
+        if mask is None:
+            mask = _causal_mask(seq_len, x.device)
         x = self.temporal(x, mask=mask)
+        x = _apply_valid_mask(torch.nan_to_num(x), valid_mask)
         x = self.norm(x)
+        x = _apply_valid_mask(x, valid_mask)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def get_action_and_value(
@@ -885,8 +943,16 @@ class AttentionActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, values = self.forward(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
+        logits, values = self.forward(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask=valid_mask,
+        )
         dist = _safe_categorical(logits[:, -1])
         if action is None:
             action = dist.sample()
@@ -1082,6 +1148,44 @@ def _alibi_attention_mask(
     return bias
 
 
+def _apply_valid_mask(x: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+    if valid_mask is None:
+        return x
+    return x * valid_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+
+
+def _causal_attention_bias(seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    positions = torch.arange(seq_len, device=device)
+    future = positions[None, :] > positions[:, None]
+    bias = torch.zeros((1, 1, seq_len, seq_len), device=device, dtype=dtype)
+    return bias.masked_fill(future.view(1, 1, seq_len, seq_len), torch.finfo(dtype).min)
+
+
+def _padding_attention_bias(valid_mask: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    valid = valid_mask.to(device=device).bool()
+    query_valid = valid[:, None, :, None]
+    key_invalid = ~valid[:, None, None, :]
+    bias = torch.zeros((valid.shape[0], 1, valid.shape[1], valid.shape[1]), device=device, dtype=dtype)
+    return bias.masked_fill(query_valid & key_invalid, torch.finfo(dtype).min)
+
+
+def _temporal_attention_mask(
+    valid_mask: torch.Tensor | None,
+    seq_len: int,
+    n_heads: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if valid_mask is None:
+        return None
+    valid = valid_mask.to(device=device).bool()
+    positions = torch.arange(seq_len, device=device)
+    causal = positions[None, :] > positions[:, None]
+    padding = valid[:, :, None] & ~valid[:, None, :]
+    mask = causal.unsqueeze(0) | padding
+    return mask[:, None].expand(-1, n_heads, -1, -1).reshape(-1, seq_len, seq_len)
+
+
 def _parse_valid_actions(value: Any) -> list[int] | None:
     if value is None or value == "":
         return None
@@ -1113,4 +1217,4 @@ def _direction_index(direction: torch.Tensor | None, batch: int, device: torch.d
 
 
 def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-    return torch.full((seq_len, seq_len), float("-inf"), device=device).triu_(1)
+    return torch.ones((seq_len, seq_len), dtype=torch.bool, device=device).triu_(1)

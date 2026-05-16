@@ -1,0 +1,69 @@
+[{"stream_name":"stderr","time":7.434195143,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":7.434273915,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":7.434280435,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":7.434284845,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stderr","time":8.054343437,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":8.054380807,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":8.054387751,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":8.054407383,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stdout","time":9.218903427,"data":"Thu May 14 16:44:28 2026       \n"}
+,{"stream_name":"stdout","time":9.218956474,"data":"+-----------------------------------------------------------------------------------------+\n"}
+,{"stream_name":"stdout","time":9.218963532,"data":"| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |\n"}
+,{"stream_name":"stdout","time":9.218967455,"data":"+-----------------------------------------+------------------------+----------------------+\n"}
+,{"stream_name":"stdout","time":9.218971602,"data":"| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n"}
+,{"stream_name":"stdout","time":9.218975476,"data":"| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n"}
+,{"stream_name":"stdout","time":9.218979518,"data":"|                                         |                        |               MIG M. |\n"}
+,{"stream_name":"stdout","time":9.218983391,"data":"|=========================================+========================+======================|\n"}
+,{"stream_name":"stdout","time":9.266454965,"data":"|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |\n"}
+,{"stream_name":"stdout","time":9.266492109,"data":"| N/A   54C    P8             10W /   70W |       0MiB /  15360MiB |      0%      Default |\n"}
+,{"stream_name":"stdout","time":9.266549787,"data":"|                                         |                        |                  N/A |\n"}
+,{"stream_name":"stdout","time":9.266555081,"data":"+-----------------------------------------+------------------------+----------------------+\n"}
+,{"stream_name":"stdout","time":9.266559548,"data":"|   1  Tesla T4                       Off |   00000000:00:05.0 Off |                    0 |\n"}
+,{"stream_name":"stdout","time":9.266563361,"data":"| N/A   50C    P8              9W /   70W |       0MiB /  15360MiB |      0%      Default |\n"}
+,{"stream_name":"stdout","time":9.266567675,"data":"|                                         |                        |                  N/A |\n"}
+,{"stream_name":"stdout","time":9.266571685,"data":"+-----------------------------------------+------------------------+----------------------+\n"}
+,{"stream_name":"stdout","time":9.267446219,"data":"\n"}
+,{"stream_name":"stdout","time":9.267462868,"data":"+-----------------------------------------------------------------------------------------+\n"}
+,{"stream_name":"stdout","time":9.26746741,"data":"| Processes:                                                                              |\n"}
+,{"stream_name":"stdout","time":9.267486104,"data":"|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n"}
+,{"stream_name":"stdout","time":9.267490206,"data":"|        ID   ID                                                               Usage      |\n"}
+,{"stream_name":"stdout","time":9.267494182,"data":"|=========================================================================================|\n"}
+,{"stream_name":"stdout","time":9.269054109,"data":"|  No running processes found                                                             |\n"}
+,{"stream_name":"stdout","time":9.269076895,"data":"+-----------------------------------------------------------------------------------------+\n"}
+,{"stream_name":"stdout","time":9.39100823,"data":"$ nvidia-smi\n"}
+,{"stream_name":"stdout","time":9.564358366,"data":"Python: 3.12.12 (main, Oct 10 2025, 08:52:57) [GCC 11.4.0]\n"}
+,{"stream_name":"stdout","time":9.764736039,"data":"$ /usr/bin/python3 -m pip install -q --upgrade pip\n"}
+,{"stream_name":"stdout","time":12.255700123,"data":"   ©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥©¥ 1.8/1.8 MB 21.7 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":15.958374454,"data":"$ /usr/bin/python3 -m pip install -q gymnasium minigrid tensorboard tqdm einops matplotlib imageio[ffmpeg]\n"}
+,{"stream_name":"stdout","time":19.362839713,"data":"Installing mamba-ssm ...\n"}
+,{"stream_name":"stdout","time":19.362889559,"data":"$ /usr/bin/python3 -m pip install -q --no-cache-dir causal-conv1d mamba-ssm --no-build-isolation\n"}
+,{"stream_name":"stdout","time":61.457759049,"data":"torch=2.10.0+cu128  cuda=12.8  GPU count=2\n"}
+,{"stream_name":"stderr","time":62.186888455,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stderr","time":62.186921403,"data":"  File \"\u003cstring\u003e\", line 1, in \u003cmodule\u003e\n"}
+,{"stream_name":"stderr","time":62.186929983,"data":"  File \"/usr/local/lib/python3.12/dist-packages/papermill/execute.py\", line 131, in execute_notebook\n"}
+,{"stream_name":"stderr","time":62.187082923,"data":"    raise_for_execution_errors(nb, output_path)\n"}
+,{"stream_name":"stderr","time":62.187137041,"data":"  File \"/usr/local/lib/python3.12/dist-packages/papermill/execute.py\", line 251, in raise_for_execution_errors\n"}
+,{"stream_name":"stderr","time":62.187356698,"data":"    raise error\n"}
+,{"stream_name":"stderr","time":62.187437421,"data":"papermill.exceptions.PapermillExecutionError: \n"}
+,{"stream_name":"stderr","time":62.187463499,"data":"---------------------------------------------------------------------------\n"}
+,{"stream_name":"stderr","time":62.187476472,"data":"Exception encountered at \"In [3]\":\n"}
+,{"stream_name":"stderr","time":62.187481486,"data":"---------------------------------------------------------------------------\n"}
+,{"stream_name":"stderr","time":62.187486081,"data":"AttributeError                            Traceback (most recent call last)\n"}
+,{"stream_name":"stderr","time":62.187491071,"data":"/tmp/ipykernel_23/2635986463.py in \u003ccell line: 0\u003e()\n"}
+,{"stream_name":"stderr","time":62.187496787,"data":"     10 for i in range(num_gpus):\n"}
+,{"stream_name":"stderr","time":62.187502063,"data":"     11     prop = torch.cuda.get_device_properties(i)\n"}
+,{"stream_name":"stderr","time":62.187507306,"data":"---\u003e 12     print(f\"  GPU {i}: {prop.name}  {prop.total_mem/1e9:.1f} GB\")\n"}
+,{"stream_name":"stderr","time":62.187512197,"data":"     13 \n"}
+,{"stream_name":"stderr","time":62.187516752,"data":"     14 # Validate Mamba-3\n"}
+,{"stream_name":"stderr","time":62.187522194,"data":"\n"}
+,{"stream_name":"stderr","time":62.187535513,"data":"AttributeError: 'torch._C._CudaDeviceProperties' object has no attribute 'total_mem'\n"}
+,{"stream_name":"stderr","time":62.187539403,"data":"\n"}
+,{"stream_name":"stderr","time":64.27725962,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":64.277292188,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":64.436534053,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":64.436560071,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":65.670176431,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to notebook\n"}
+,{"stream_name":"stderr","time":65.963575455,"data":"[NbConvertApp] Writing 22365 bytes to __notebook__.ipynb\n"}
+,{"stream_name":"stderr","time":68.26106762,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to html\n"}
+,{"stream_name":"stderr","time":69.083975748,"data":"[NbConvertApp] Writing 332997 bytes to __results__.html\n"}
+]
