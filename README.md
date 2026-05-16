@@ -1,23 +1,21 @@
 # Mamba-MiniGrid-Memory-Agent
 
-用 Mamba/Mamba3、Gated Attention (GTrXL)、GRU 等序列模型训练 MiniGrid Memory 部分可观察任务中的 PPO agent，并与 MLP、LSTM 等 baseline 对比。
+用 Mamba/Mamba3、Gated Attention (GTrXL)、GRU 等序列模型训练 MiniGrid Memory 部分可观察任务中的 PPO agent，并与 MLP、LSTM、Attention 等 baseline 对比。
 
-核心问题：
+当前研究主线：
 
-> 在 MiniGrid Memory 中，选择性状态空间模型和门控 Transformer 能否作为 PPO agent 的高效记忆模块？
+> 结构化对象槽 + episode-local cue memory，能否让 Mamba3 / GatedAttention / GRU 在 MiniGrid Memory 中更可靠地保存并调用起点 cue？
 
 ## 任务设定
 
-MiniGrid Memory 的 agent 会先看到一个起始物体，随后穿过走廊，在岔路口必须选择与起始物体匹配的一侧。当前观测是局部 `7x7x3` compact semantic grid，不是 RGB 图像。
+MiniGrid Memory 的 agent 会先看到一个起始物体，随后穿过走廊，在岔路口选择与起始物体匹配的一侧。当前观测是局部 `7x7x3` compact semantic grid，不是 RGB 图像。
 
-变体难度递增：
-
-| 环境 | 特点 |
-|---|---|
-| `MiniGrid-MemoryS11-v0` | 最小固定走廊，最容易 |
-| `MiniGrid-MemoryS13-v0` | 中等固定走廊 |
-| `MiniGrid-MemoryS13Random-v0` | 中等随机走廊 |
-| `MiniGrid-MemoryS17Random-v0` | 最大随机走廊，最难 |
+| 环境 | 特点 | 建议用途 |
+|---|---|---|
+| `MiniGrid-MemoryS11-v0` | 最小固定走廊 | smoke、调 bug、快速验证 |
+| `MiniGrid-MemoryS13-v0` | 中等固定走廊 | 验证结构能否稳定学会 |
+| `MiniGrid-MemoryS13Random-v0` | 中等随机走廊 | 主消融环境 |
+| `MiniGrid-MemoryS17Random-v0` | 最大随机走廊 | 最终泛化目标 |
 
 虽然官方环境暴露 `Discrete(7)` 动作空间，但 Memory 任务只需要导航动作：
 
@@ -27,25 +25,14 @@ MiniGrid Memory 的 agent 会先看到一个起始物体，随后穿过走廊，
 2 forward
 ```
 
-`pickup/drop/toggle/done` 对该任务没有帮助，保留它们会让 PPO 浪费大量样本。因此本项目默认使用 action mask：`--valid-actions 0,1,2`。
+因此本项目默认使用 action mask：`--valid-actions 0,1,2`。不要先打开其它动作做主实验，否则 PPO 会把大量样本浪费在 `pickup/drop/toggle/done` 上。
 
-## 可用模型
+## 当前最好结构
 
-| 模型 | `--model` | 说明 |
-|---|---|---|
-| MLP | `mlp` | Feedforward baseline，无记忆 |
-| LSTM | `lstm` | 循环 baseline |
-| GRU | `gru` | 轻量循环 baseline |
-| Attention | `attention` | 因果 Transformer (标准残差) |
-| Gated Attention | `gated_attention` | GTrXL 风格 (GRU 门控残差 + FlashAttention) |
-| Mamba | `mamba` | SSM backbone，variant 可选 mamba/mamba2/mamba3 |
-
-## 当前网络架构
-
-默认 SOTA-oriented 配置：
+默认主线已经切到 v2 slot-memory 结构：
 
 ```text
-MiniGrid compact obs: [7, 7, 3]
+7x7x3 compact semantic grid
   + direction
   + prev_action
   + prev_reward
@@ -56,63 +43,109 @@ object/color/state embeddings
 Hybrid spatial encoder
   depthwise conv residual blocks
   learned saliency pooling
-  optional TNL3 slot attention (--slot-count N)
-  direction-conditioned summary
+  iterative slot attention (--slot-extractor iterative)
         |
-trajectory tokens: [B, T, d_model]
+step-level slot fusion (--temporal-token-mode fuse)
         |
-  ┌─────────────────────────────────┐
-  │ Mamba / GatedAttention / LSTM   │  ← temporal backbone
-  │ GRU / Attention / MLP           │
-  └─────────────────────────────────┘
+episode-local cue memory (--memory-kind episodic_cue)
+  write: 只从 compact obs 中第一次看到的 object/color cue 写入
+  read: 每步用 fused/global token 查询
+  gate: learned gate 控制 retrieved cue 融合强度
         |
-LayerNorm
+temporal backbone
+  GRU / GatedAttention(ALiBi) / Mamba3
         |
 actor head  -> masked action logits
 critic head -> value
+cue head    -> auxiliary cue recall
 ```
 
-旧的 spatial Transformer 仍可通过 `--spatial-encoder transformer` 启用，用于消融实验。默认 `hybrid` — 局部卷积更高效地建模墙、走廊和岔路结构，saliency pooling 更直接地提取可见物体线索。
-
-## 为什么 Gated Attention / Mamba 适合这个任务
-
-**Gated Attention (GTrXL):** 来自 Parisotto et al. "Stabilizing Transformers for RL"。用 GRU 风格的三门（reset/update/candidate）替代标准残差连接，解决 Transformer 在 RL 中的训练不稳定问题。update gate 初始化为 near-identity，让 PPO 早期梯度更平稳。
-
-**Mamba:** 来自选择性状态空间模型。每一步 token 是输入 `u_t`，Mamba 维护隐状态 `h_t`：
+默认关键开关：
 
 ```text
-h_t = A_t h_{t-1} + B_t u_t
-y_t = C_t h_t
+--slot-count 4
+--slot-extractor iterative
+--slot-iters 3
+--slot-mlp-ratio 2.0
+--temporal-token-mode fuse
+--memory-kind episodic_cue
+--memory-slots 16
+--memory-topk 4
+--memory-write-window 12
+--aux-recall-coef 0.05
 ```
 
-其中 `A_t/B_t/C_t` 动态依赖当前输入。隐状态可以学习保存：起始物体是什么、当前在走廊还是岔路口、该走哪条分支。
+保留的消融开关：
 
-## 快速训练
-
-### Kaggle (推荐 T4 x2, 15GB+)
-
-```bash
-python src/train_mamba_ppo.py \
-    --model gated_attention \
-    --env-id MiniGrid-MemoryS17Random-v0 \
-    --num-envs 128 \
-    --num-steps 128 \
-    --context-len 128 \
-    --chunk-len 128 \
-    --batch-chunks 32 \
-    --d-model 256 \
-    --attention-layers 2 \
-    --attention-heads 8 \
-    --lr 1e-4 \
-    --total-steps 2000000
+```text
+--slot-extractor query_pool
+--temporal-token-mode flatten
+--memory-kind none
+--aux-recall-coef 0.0
+--slot-count 0
 ```
 
-### Windows 本地 (RTX 3060 6GB+)
+## 可用模型
+
+| 模型 | `--model` | 建议定位 |
+|---|---|---|
+| MLP | `mlp` | 无记忆下限，不作为主线 |
+| LSTM | `lstm` | 传统 recurrent baseline |
+| GRU | `gru` | 低复杂度 recurrent baseline，先跑它确认结构有效 |
+| Attention | `attention` | 标准 causal Transformer 消融 |
+| Gated Attention | `gated_attention` | 主力 Transformer baseline，推荐 `--gated-attention-pos alibi` |
+| Mamba | `mamba` | SSM backbone，主线用 `--mamba-variant mamba3` |
+
+## 快速开始
+
+所有命令建议在 `mamba_env` 中运行：
 
 ```powershell
-python src/train_mamba_ppo.py `
+micromamba run -n mamba_env python -m pytest tests -q
+```
+
+### 1. 最小 smoke
+
+```powershell
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
+    --model gru `
+    --env-id MiniGrid-MemoryS11-v0 `
+    --total-steps 200000 `
+    --num-envs 16 `
+    --num-steps 128 `
+    --context-len 128 `
+    --chunk-len 64 `
+    --batch-chunks 8 `
+    --d-model 128 `
+    --eval-interval 20000 `
+    --run-name smoke_slot_memory_gru
+```
+
+### 2. 主实验 GRU
+
+```powershell
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
+    --model gru `
+    --env-id MiniGrid-MemoryS13Random-v0 `
+    --total-steps 5000000 `
+    --num-envs 32 `
+    --num-steps 128 `
+    --context-len 128 `
+    --chunk-len 64 `
+    --batch-chunks 8 `
+    --d-model 128 `
+    --lr 2.5e-4 `
+    --run-name slot_memory_gru_s13random_seed42
+```
+
+### 3. 主实验 GatedAttention(ALiBi)
+
+```powershell
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
     --model gated_attention `
-    --env-id MiniGrid-MemoryS17Random-v0 `
+    --gated-attention-pos alibi `
+    --env-id MiniGrid-MemoryS13Random-v0 `
+    --total-steps 10000000 `
     --num-envs 64 `
     --num-steps 128 `
     --context-len 128 `
@@ -122,99 +155,301 @@ python src/train_mamba_ppo.py `
     --attention-layers 2 `
     --attention-heads 4 `
     --lr 2.5e-4 `
-    --total-steps 2000000
+    --run-name slot_memory_gated_alibi_s13random_seed42
 ```
 
-### 断点续训
-
-```bash
-python src/train_mamba_ppo.py \
-    --resume-from runs/<run_name>/model_latest.pt \
-    ...  # 其余参数与首次训练一致
-```
-
-### 脚本方式 (mamba3 overnight)
+### 4. 主实验 Mamba3
 
 ```powershell
-.\scripts\train_overnight_mamba.ps1 `
-    -MambaVariant mamba3 `
-    -EnvId MiniGrid-MemoryS17Random-v0 `
-    -TotalSteps 100000000
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
+    --model mamba `
+    --mamba-variant mamba3 `
+    --env-id MiniGrid-MemoryS13Random-v0 `
+    --total-steps 10000000 `
+    --num-envs 64 `
+    --num-steps 128 `
+    --context-len 128 `
+    --chunk-len 64 `
+    --batch-chunks 16 `
+    --d-model 128 `
+    --mamba-layers 2 `
+    --lr 1e-4 `
+    --amp bf16 `
+    --run-name slot_memory_mamba3_s13random_seed42
 ```
 
-## 重要参数
+### 5. Curriculum 到 S17Random
+
+```powershell
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
+    --model gated_attention `
+    --gated-attention-pos alibi `
+    --curriculum `
+    --total-steps 30000000 `
+    --num-envs 64 `
+    --num-steps 128 `
+    --context-len 128 `
+    --chunk-len 64 `
+    --batch-chunks 16 `
+    --d-model 128 `
+    --lr 2.5e-4 `
+    --run-name slot_memory_gated_alibi_curriculum_seed42
+```
+
+默认 curriculum 顺序：
 
 ```text
---model gated_attention       序列模型选择
---mamba-variant mamba3        mamba/mamba2/mamba3
---spatial-encoder hybrid      hybrid 或 transformer
---valid-actions 0,1,2         动作掩码
---context-len 128             上下文窗口长度
---chunk-len 128               PPO 序列 chunk 长度
---num-steps 128               每次 rollout 步数
---num-envs 128                并行环境数
---batch-chunks 32             每次 PPO update 的 chunk 数
---d-model 128/256/512         模型维度
---ent-coef 0.01               entropy 系数起始值
---ent-coef-final 0.001        线性退火终值
---slot-count 4                TNL3 slot 数量 (0 = 关闭)
---spinning-penalty 0.0        原地打转惩罚
---spinning-threshold 10       容忍步数
---amp bf16                    混合精度 (none / bf16 / fp16)
---torch-compile               torch.compile 加速
+S11 -> S13 -> S13Random -> S17Random
 ```
 
-`ent-coef` 会线性退火到 `ent-coef-final`：前期鼓励探索，后期让 greedy policy 更稳定。
+默认晋级线：
+
+```text
+--curriculum-thresholds 0.90,0.85,0.80
+--curriculum-patience 3
+```
+
+## 消融实验
+
+一键生成结构消融命令：
+
+```powershell
+.\scripts\run_slot_memory_ablation.ps1 `
+    -EnvId MiniGrid-MemoryS13Random-v0 `
+    -Models "gru,gated_attention,mamba3" `
+    -Seeds "42,43,44" `
+    -TotalSteps 5000000
+```
+
+默认只是 dry run 打印命令。真正执行加 `-Execute`：
+
+```powershell
+.\scripts\run_slot_memory_ablation.ps1 `
+    -EnvId MiniGrid-MemoryS13Random-v0 `
+    -Models "gru,gated_attention,mamba3" `
+    -Seeds "42,43,44" `
+    -TotalSteps 5000000 `
+    -Execute
+```
+
+脚本覆盖以下结构：
+
+| 名称 | 结构 |
+|---|---|
+| `query_pool_flatten_nomem` | 旧 query pooling + flatten token + no memory |
+| `query_pool_fuse_nomem` | query pooling + step fusion + no memory |
+| `iterative_fuse_nomem` | iterative slots + step fusion + no memory |
+| `iterative_fuse_memory` | iterative slots + step fusion + cue memory |
+| `iterative_fuse_memory_aux` | iterative slots + step fusion + cue memory + aux recall |
+
+## 超参数怎么调
+
+调参优先级建议固定为：
+
+```text
+1. 先固定 PPO，比较结构消融
+2. 再比较 GRU / GatedAttention / Mamba3
+3. 再调 context_len、chunk_len、num_envs、batch_chunks
+4. 最后微调 lr、entropy、模型宽度
+```
+
+### 结构与记忆参数
+
+| 参数 | 推荐值 | 什么时候改 |
+|---|---:|---|
+| `--valid-actions` | `0,1,2` | 主实验不要改，打开其它动作只做负向诊断 |
+| `--spatial-encoder` | `hybrid` | `transformer` 只做 spatial encoder 消融 |
+| `--spatial-layers` | `2` | `transformer` encoder 才主要受影响；速度紧张用 `1` |
+| `--spatial-heads` | `4` | `d_model=256` 可试 `8` |
+
+| 参数 | 推荐值 | 什么时候改 |
+|---|---:|---|
+| `--slot-count` | `4` | `0` 做无 slot 消融；`2` 提速；`8` 只在 S17Random 仍明显欠拟合时试 |
+| `--slot-extractor` | `iterative` | `query_pool` 只做旧结构消融 |
+| `--slot-iters` | `3` | 显存/速度紧张用 `2`；slot 指标差再试 `4` |
+| `--slot-mlp-ratio` | `2.0` | 一般不动；大模型可试 `3.0` |
+| `--temporal-token-mode` | `fuse` | `flatten` 只做消融；主线不要让 actor/critic 间接读 slot |
+| `--memory-kind` | `episodic_cue` | `none` 是关键消融 |
+| `--memory-slots` | `16` | S11/S13 可试 `8`；S17Random 可试 `32`，但先看收益 |
+| `--memory-topk` | `4` | 读太散用 `1` 或 `2`；retrieval entropy 太低且不稳定再试 `8` |
+| `--memory-write-window` | `12` | 必须覆盖 episode 早期看到 cue 的窗口；S11 可 `8`，随机长走廊可 `12` 或 `16` |
+| `--aux-recall-coef` | `0.05` | `0.0` 做消融；aux loss 压主任务就降到 `0.01`；cue recall 长期低再试 `0.1` |
+
+看 TensorBoard 指标时：
+
+| 指标 | 解释 | 调整 |
+|---|---|---|
+| `loss/aux_recall_acc` | cue 能否被 hidden 表示预测出来 | 低于随机太久，先检查 memory 写入和 `aux_recall_coef` |
+| `memory/gate_mean` | retrieved cue 融入强度 | 长期接近 `0` 表示 memory 没被用上 |
+| `memory/retrieval_entropy` | 检索分布是否过散 | 很高说明读不准，降低 `memory_topk` 或增强 aux |
+| `memory/write_rate` | 初期 cue 写入比例 | 长期为 `0` 说明 cue target 提取或 write window 有问题 |
+
+### Backbone 参数
+
+| 参数 | GRU | GatedAttention | Mamba3 |
+|---|---:|---:|---:|
+| `--d-model` | `128` | `128` 本地，`256` 大显存 | `128` 本地，`256` 大显存 |
+| 层数 | `--gru-layers 1` | `--attention-layers 2` | `--mamba-layers 2` |
+| heads | 不适用 | `--attention-heads 4`，大模型用 `8` | 不适用 |
+| 位置编码 | 不适用 | `--gated-attention-pos alibi` | `--mamba-rope-fraction 0.5` |
+| 学习率 | `2.5e-4` | `2.5e-4` 或 `1e-4` | `1e-4` 起步 |
+
+Mamba3 额外参数：
+
+| 参数 | 推荐值 | 说明 |
+|---|---:|---|
+| `--d-state` | `16` | 先不扩大，避免训练变慢 |
+| `--d-conv` | `4` | 默认足够 |
+| `--expand` | `2` | 默认足够 |
+| `--mamba-headdim` | `64` | 通常与 `d_model=128/256` 搭配稳定 |
+| `--mamba-ngroups` | `1` | 先不动 |
+| `--mamba-chunk-size` | `64` | 与 `chunk_len=64` 对齐 |
+| `--mamba-rope-fraction` | `0.5` | 先不动 |
+
+LSTM 只作为 baseline，默认 `--lstm-layers 1`。如果 LSTM 明显欠拟合，可以试 `2` 层，但优先把同样预算给 GRU / GatedAttention / Mamba3 主线。
+
+### PPO 与序列训练参数
+
+| 参数 | 推荐值 | 调整规则 |
+|---|---:|---|
+| `--total-steps` | S11 `1M`，S13 `3M-10M`，S13Random `10M-30M`，S17Random `30M+` | smoke 可以小很多，正式结论不要只看早期曲线 |
+| `--num-envs` | 本地 `16/32/64`，服务器 `128` | SPS 低但显存够就加；显存爆就降 |
+| `--num-steps` | `128` | 先固定；短任务可 `64`，S17Random 可试 `256` |
+| `--context-len` | `128` | 必须覆盖从看到 cue 到做决策的距离；S17Random 可试 `256` |
+| `--chunk-len` | `64` | 必须 `<= num_steps`；稳定后可和 `context_len` 一起升到 `128` |
+| `--batch-chunks` | 本地 `8/16`，服务器 `32` | 相当于序列 mini-batch 大小，显存爆就降 |
+| `--batch-size` | `256` | 主要给非序列/旧路径使用；slot-memory 主线优先调 `batch-chunks` |
+| `--n-epochs` | `4` | KL 过大或训练震荡降到 `2`；样本利用不足试 `6` |
+| `--lr` | GRU/Gated `2.5e-4`，Mamba3 `1e-4` | collapse、KL 飙升、success 回落就降一档 |
+| `--gamma` | `0.99` | MiniGrid Memory 先不动 |
+| `--gae-lambda` | `0.95` | 方差大可试 `0.90`，通常不需要 |
+| `--clip-coef` | `0.2` | PPO 默认稳妥值 |
+| `--vf-coef` | `0.5` | value loss 明显压 policy 再降到 `0.25` |
+| `--ent-coef` | `0.01` | 探索不足升到 `0.02`；策略长期随机降到 `0.005` |
+| `--ent-coef-final` | `0.001` | 后期 greedy 不稳可降到 `0.0005` |
+| `--max-grad-norm` | `0.5` | 梯度尖峰多可降到 `0.25` |
+| `--target-kl` | 默认不设 | 不稳定时试 `0.03` 或 `0.05` |
+| `--dropout` | `0.0` | RL 中先不加；明显过拟合再试 `0.05` |
+| `--spinning-penalty` | `0.0` | 只在明显原地转圈时试小值，不作为主实验默认 |
+| `--spinning-threshold` | `10` | 配合 spinning penalty 使用 |
+
+这些训练稳定性选项默认已经打开，主实验不要关闭：
+
+```text
+learning-rate annealing
+advantage normalization
+value loss clipping
+stateful rollout
+```
+
+对应的关闭开关分别是 `--no-anneal-lr`、`--no-norm-adv`、`--no-clip-vloss`、`--no-stateful-rollout`。它们只适合做诊断，不建议放进主结果。
+
+### 运行与工程参数
+
+| 参数 | 推荐值 | 说明 |
+|---|---:|---|
+| `--amp` | CUDA 上 `bf16`，不稳定就 `none` | `fp16` 更容易数值不稳 |
+| `--compile` | 最后长跑再开 | 先不用它调 bug |
+| `--eval-interval` | `20000` | 长跑可 `50000` |
+| `--eval-episodes` | smoke `10`，正式 `30/100` | 报告结果建议 `100` |
+| `--save-interval` | `100000` | 长跑保留 latest/final |
+| `--log-interval` | `10` | 调试可降到 `1` |
+| `--seed` | `42,43,44` | 主结论至少 3 seeds |
+| `--run-name` | 自动生成或手动命名 | 正式实验建议写清 backbone、结构、环境和 seed |
+| `--resume-from` | 空 | 从 `runs/<run_name>/model_latest.pt` 续训 |
+| `--allow-legacy-load` | 默认不开 | 只有旧 checkpoint 兼容加载时显式打开 |
+
+## 推荐实验顺序
+
+第一组先证明结构价值，固定 `--model gru`：
+
+```text
+query_pool + flatten + no_memory
+query_pool + fuse + no_memory
+iterative + fuse + no_memory
+iterative + fuse + episodic_cue_memory
+iterative + fuse + episodic_cue_memory + aux_recall
+```
+
+第二组再证明 backbone 差异，固定最佳结构：
+
+```text
+GRU
+GatedAttention + ALiBi
+Mamba3
+可选 Mamba2
+```
+
+第三组做难度迁移：
+
+```text
+S11 -> S13 -> S13Random -> S17Random
+```
+
+主指标：
+
+```text
+eval/success_rate       greedy 成功率，80% 是主目标线
+eval/mean_return        平均 return
+eval/mean_length        平均 episode 长度
+charts/SPS              每秒环境步数
+loss/aux_recall_acc     cue recall accuracy
+memory/gate_mean        memory gate activation
+memory/retrieval_entropy
+memory/write_rate
+达到 80% success 所需环境步数
+```
 
 ## 评估和可视化
 
-```bash
-python src/eval.py runs/<run_name>/model_latest.pt --episodes 100
-python src/visualize.py runs/<run_name>/model_latest.pt --episodes 3
+```powershell
+micromamba run -n mamba_env python src\eval.py runs\<run_name>\model_latest.pt --episodes 100
+micromamba run -n mamba_env python src\visualize.py runs\<run_name>\model_latest.pt --episodes 3
 ```
 
-默认评估是 greedy。需要随机采样加 `--stochastic`。加载旧 checkpoint 有 key 不匹配时加 `--allow-legacy-load`。
+默认评估是 greedy。需要随机采样时加 `--stochastic`。旧 checkpoint 有字段不匹配时才加 `--allow-legacy-load`。
+
+## Checkpoint 规则
+
+新 checkpoint 会保存：
+
+```text
+schema version
+最终 config
+包版本
+CUDA / Mamba variant
+git sha
+```
+
+默认严格加载。旧实验只作参考，不作为严格对比结论。
 
 ## 代码结构
 
 ```text
-src/envs.py                          MiniGrid wrapper：compact obs + direction + side inputs
-src/models.py                        MLP/LSTM/GRU/Mamba/Attention/GatedAttention actor-critic
-src/ppo.py                           rollout buffer、GAE、PPO update、stateful context
-src/train_mamba_ppo.py               统一训练入口
-src/train_mlp_baseline.py            MLP 单独训练
-src/train_lstm_baseline.py           LSTM 单独训练
-src/train_attention_baseline.py      Attention 单独训练
-src/train_gru_baseline.py            GRU 单独训练
-src/impala.py                        Impala/V-trace trainer (实验性)
-src/r2d2.py                          R2D2 recurrent replay trainer (实验性)
-src/eval.py                          checkpoint 评估
-src/visualize.py                     rollout 打印和视频保存
-scripts/train_overnight_mamba.ps1    Windows overnight 训练脚本
-scripts/setup_mamba3_triton_windows.ps1  Mamba3/Triton 环境配置
-tests/                               测试文件
+src/envs.py                         MiniGrid wrapper：compact obs + direction + side inputs
+src/cue.py                          从 compact obs 提取 object/color cue target
+src/models.py                       MLP/LSTM/GRU/Mamba/Attention/GatedAttention actor-critic
+src/ppo.py                          rollout buffer、GAE、PPO update、stateful context、aux recall loss
+src/train_mamba_ppo.py              统一训练入口、curriculum、checkpoint、memory diagnostics
+src/eval.py                         checkpoint 评估
+src/visualize.py                    rollout 打印和视频保存
+scripts/run_slot_memory_ablation.ps1  slot-memory 消融脚本
+scripts/train_overnight_mamba.ps1   Windows overnight 训练脚本
+tests/                              单元测试和 smoke 测试
 ```
 
-## 实验建议
+## 判断是否继续加新机制
 
-推荐按顺序做：
+先不要急着加 DNC、RAG、Neural Map、IMPALA 或 R2D2。只有当下面这个结构明显优于旧 baseline，再继续扩展：
 
 ```text
-1. S11: MLP vs LSTM vs GRU vs Mamba3 vs GatedAttention
-2. S13: LSTM vs Mamba3 vs GatedAttention
-3. S17Random: curriculum (S11→S13→S13Random→S17Random) 后的泛化
-4. spatial_encoder: transformer vs hybrid
-5. context_len: 64 / 128 / 256
-6. slot attention: --slot-count 0/4/8 消融
-7. GatedAttention vs Attention (GRU 门控消融)
+iterative + fuse + episodic_cue_memory + aux_recall
 ```
 
-关键指标：
+最低比较对象：
 
 ```text
-eval/success_rate       成功率 (>80% 为通过线)
-eval/mean_return        平均 return
-eval/mean_length        平均 episode 长度
-charts/SPS              每秒环境步数
-达到 80% success rate 所需环境步数
+query_pool + flatten + no_memory
 ```
+
+如果新结构在 S13Random 多 seed 上没有明显优势，优先检查 cue target、memory gate、retrieval entropy 和 aux recall，而不是继续堆更大的记忆系统。
