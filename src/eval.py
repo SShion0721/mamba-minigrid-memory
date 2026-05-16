@@ -33,6 +33,7 @@ def evaluate(
     seed: int = 999,
     env_id: str | None = None,
     deterministic: bool = True,
+    allow_legacy_load: bool = False,
 ) -> dict[str, float]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -45,8 +46,8 @@ def evaluate(
     probe_env.close()
 
     model = build_actor_critic(cfg, action_dim=action_dim).to(device)
-    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if missing or unexpected:
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=not allow_legacy_load)
+    if allow_legacy_load and (missing or unexpected):
         print(f"Checkpoint loaded with missing={missing} unexpected={unexpected}")
     model.eval()
 
@@ -75,7 +76,7 @@ def evaluate(
         last_reward = 0.0
 
         while not done:
-            if cfg.model in {"mamba", "lstm", "attention", "gated_attention"}:
+            if cfg.model in {"mamba", "lstm", "gru", "attention", "gated_attention"}:
                 obs_ctx.append(obs)
                 dir_ctx.append(direction)
                 act_ctx.append(prev_action)
@@ -157,7 +158,7 @@ def _sequence_action(
     *,
     deterministic: bool,
 ) -> int:
-    obs_seq, dir_seq, act_seq, rew_seq, start_seq = _pack_context(
+    obs_seq, dir_seq, act_seq, rew_seq, start_seq, valid_mask = _pack_context(
         obs_ctx,
         dir_ctx,
         act_ctx,
@@ -173,8 +174,11 @@ def _sequence_action(
             torch.as_tensor(act_seq, device=device),
             torch.as_tensor(rew_seq, device=device),
             torch.as_tensor(start_seq, device=device),
+            valid_mask=torch.as_tensor(valid_mask, device=device),
         )
-        last_logits = logits[:, -1]
+        mask_t = torch.as_tensor(valid_mask, device=device)
+        last_idx = mask_t.long().sum(dim=1).clamp(min=1, max=logits.shape[1]) - 1
+        last_logits = logits[torch.arange(logits.shape[0], device=device), last_idx]
         if deterministic:
             safe_logits = torch.nan_to_num(last_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
             return torch.argmax(safe_logits, dim=-1).item()
@@ -189,7 +193,7 @@ def _pack_context(
     start_ctx: deque,
     context_len: int,
     action_dim: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(obs_ctx)
     obs_shape = np.asarray(obs_ctx[0]).shape if n else (7, 7, 3)
     obs_seq = np.zeros((1, context_len, *obs_shape), dtype=np.uint8)
@@ -197,15 +201,17 @@ def _pack_context(
     act_seq = np.zeros((1, context_len, action_dim), dtype=np.float32)
     rew_seq = np.zeros((1, context_len, 1), dtype=np.float32)
     start_seq = np.zeros((1, context_len, 1), dtype=np.float32)
+    valid_mask = np.zeros((1, context_len), dtype=np.float32)
 
     if n:
-        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.uint8)
-        dir_seq[0, -n:] = np.asarray(list(dir_ctx), dtype=np.int64)
-        act_seq[0, -n:] = np.asarray(list(act_ctx), dtype=np.float32)
-        rew_seq[0, -n:] = np.asarray(list(rew_ctx), dtype=np.float32)
-        start_seq[0, -n:] = np.asarray(list(start_ctx), dtype=np.float32)
+        obs_seq[0, :n] = np.asarray(list(obs_ctx), dtype=np.uint8)
+        dir_seq[0, :n] = np.asarray(list(dir_ctx), dtype=np.int64)
+        act_seq[0, :n] = np.asarray(list(act_ctx), dtype=np.float32)
+        rew_seq[0, :n] = np.asarray(list(rew_ctx), dtype=np.float32)
+        start_seq[0, :n] = np.asarray(list(start_ctx), dtype=np.float32)
+        valid_mask[0, :n] = 1.0
 
-    return obs_seq, dir_seq, act_seq, rew_seq, start_seq
+    return obs_seq, dir_seq, act_seq, rew_seq, start_seq, valid_mask
 
 
 def _checkpoint_config(ckpt) -> SimpleNamespace:
@@ -224,6 +230,8 @@ def _checkpoint_config(ckpt) -> SimpleNamespace:
     values.setdefault("spatial_heads", 4)
     values.setdefault("dropout", 0.0)
     values.setdefault("lstm_layers", 1)
+    values.setdefault("gru_layers", 1)
+    values.setdefault("slot_count", 0)
     values.setdefault("mamba_variant", "mamba")
     values.setdefault("mamba_layers", 2)
     values.setdefault("d_state", 32)
@@ -247,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=999)
     parser.add_argument("--env-id", type=str, default=None, help="Override checkpoint env")
     parser.add_argument("--stochastic", action="store_true", help="Sample instead of greedy actions")
+    parser.add_argument("--allow-legacy-load", action="store_true", help="Load old checkpoints with strict=False")
     args = parser.parse_args()
 
     evaluate(
@@ -255,4 +264,5 @@ if __name__ == "__main__":
         seed=args.seed,
         env_id=args.env_id,
         deterministic=not args.stochastic,
+        allow_legacy_load=args.allow_legacy_load,
     )

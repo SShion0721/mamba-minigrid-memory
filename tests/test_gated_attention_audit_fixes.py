@@ -13,6 +13,7 @@ from src.eval import _sequence_action as eval_sequence_action
 from src.models import (
     AttentionActorCritic,
     FastGatedAttentionActorCritic,
+    GRUActorCritic,
     LSTMActorCritic,
     MLPActorCritic,
 )
@@ -27,18 +28,18 @@ def _sample_sequence(batch: int = 2, seq_len: int = 6, action_dim: int = 7):
     prev_reward = torch.zeros(batch, seq_len, 1)
     episode_start = torch.zeros(batch, seq_len, 1)
     valid_mask = torch.zeros(batch, seq_len)
-    valid_mask[:, -3:] = 1.0
+    valid_mask[:, :3] = 1.0
 
-    obs[:, -3:, 3, 3, 0] = torch.tensor([2, 3, 4], dtype=torch.uint8)
-    obs[:, -3:, 3, 3, 1] = torch.tensor([1, 2, 3], dtype=torch.uint8)
-    direction[:, -3:, 0] = torch.tensor([0, 1, 2], dtype=torch.long)
-    prev_action[:, -3:, 0] = 1.0
-    prev_reward[:, -3:, 0] = torch.tensor([0.0, 0.25, 0.5])
-    episode_start[:, -3:, 0] = torch.tensor([1.0, 0.0, 0.0])
+    obs[:, :3, 3, 3, 0] = torch.tensor([2, 3, 4], dtype=torch.uint8)
+    obs[:, :3, 3, 3, 1] = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    direction[:, :3, 0] = torch.tensor([0, 1, 2], dtype=torch.long)
+    prev_action[:, :3, 0] = 1.0
+    prev_reward[:, :3, 0] = torch.tensor([0.0, 0.25, 0.5])
+    episode_start[:, :3, 0] = torch.tensor([1.0, 0.0, 0.0])
     return obs, direction, prev_action, prev_reward, episode_start, valid_mask
 
 
-def test_pack_sequence_batch_right_aligns_valid_and_loss_masks():
+def test_pack_sequence_batch_left_aligns_valid_and_loss_masks():
     buffer = RolloutBuffer(num_envs=1, num_steps=5, obs_shape=(1, 1, 3), action_dim=3, context_len=8)
 
     for step in range(buffer.num_steps):
@@ -67,12 +68,14 @@ def test_pack_sequence_batch_right_aligns_valid_and_loss_masks():
         _old_value_seq,
         valid_mask,
         loss_mask,
+        lengths,
     ) = _pack_sequence_batch(buffer, [(0, 0, 2, 4)], advantages, chunk_len=4, burn_in_len=4)
 
     assert obs_seq.shape[1] == 8
-    assert obs_seq[0, :, 0, 0, 0].tolist() == [0, 0, 0, 0, 1, 2, 3, 4]
-    assert valid_mask[0].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
-    assert loss_mask[0].tolist() == [0, 0, 0, 0, 0, 0, 1, 1]
+    assert obs_seq[0, :, 0, 0, 0].tolist() == [1, 2, 3, 4, 0, 0, 0, 0]
+    assert valid_mask[0].tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert loss_mask[0].tolist() == [0, 0, 1, 1, 0, 0, 0, 0]
+    assert lengths[0] == 4
 
 
 def test_gated_attention_valid_mask_ignores_padding_tokens():
@@ -94,10 +97,10 @@ def test_gated_attention_valid_mask_ignores_padding_tokens():
         noisy_prev_action = prev_action.clone()
         noisy_prev_reward = prev_reward.clone()
 
-        noisy_obs[1, :3] = torch.randint(0, 5, noisy_obs[1, :3].shape, dtype=torch.uint8)
-        noisy_direction[1, :3, 0] = torch.tensor([3, 2, 1])
-        noisy_prev_action[1, :3, 4] = 1.0
-        noisy_prev_reward[1, :3, 0] = torch.tensor([9.0, 8.0, 7.0])
+        noisy_obs[1, 3:] = torch.randint(0, 5, noisy_obs[1, 3:].shape, dtype=torch.uint8)
+        noisy_direction[1, 3:, 0] = torch.tensor([3, 2, 1])
+        noisy_prev_action[1, 3:, 4] = 1.0
+        noisy_prev_reward[1, 3:, 0] = torch.tensor([9.0, 8.0, 7.0])
 
         with torch.no_grad():
             logits, values = model(
@@ -109,8 +112,8 @@ def test_gated_attention_valid_mask_ignores_padding_tokens():
                 valid_mask=valid_mask,
             )
 
-        torch.testing.assert_close(logits[0, -3:], logits[1, -3:], atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(values[0, -3:], values[1, -3:], atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(logits[0, :3], logits[1, :3], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(values[0, :3], values[1, :3], atol=1e-5, rtol=1e-5)
 
 
 def test_sequence_model_forward_smoke_with_valid_mask():
@@ -118,7 +121,10 @@ def test_sequence_model_forward_smoke_with_valid_mask():
 
     sequence_models = [
         LSTMActorCritic(action_dim=7, d_model=32),
+        GRUActorCritic(action_dim=7, d_model=32),
+        GRUActorCritic(action_dim=7, d_model=32, slot_count=2),
         AttentionActorCritic(action_dim=7, d_model=32, n_heads=4, context_len=6),
+        AttentionActorCritic(action_dim=7, d_model=32, n_heads=4, context_len=6, slot_count=2),
         FastGatedAttentionActorCritic(action_dim=7, d_model=32, n_heads=4, context_len=6, position_mode="learned"),
         FastGatedAttentionActorCritic(action_dim=7, d_model=32, n_heads=4, context_len=6, position_mode="alibi"),
     ]
@@ -139,12 +145,26 @@ def test_sequence_model_forward_smoke_with_valid_mask():
     assert values.shape == (1,)
 
 
+def test_action_mask_blocks_invalid_actions_exactly():
+    obs = torch.zeros(1, 7, 7, 3, dtype=torch.uint8)
+    direction = torch.zeros(1, 1, dtype=torch.long)
+    prev_action = torch.zeros(1, 7)
+    prev_reward = torch.zeros(1, 1)
+    episode_start = torch.ones(1, 1)
+    model = MLPActorCritic(action_dim=7, d_model=32, valid_actions=[0, 1, 2])
+    with torch.no_grad():
+        logits, _ = model(obs, direction, prev_action, prev_reward, episode_start)
+        probs = torch.softmax(logits, dim=-1)
+    assert torch.all(probs[:, 3:] == 0)
+    assert torch.all(probs[:, :3] > 0)
+
+
 def test_eval_and_visualize_stochastic_sampling_are_nan_safe():
     class BadLogitModel:
-        def forward(self, obs_seq, *_args):
+        def forward(self, obs_seq, *_args, **_kwargs):
             batch, seq_len = obs_seq.shape[:2]
             logits = torch.zeros(batch, seq_len, 3)
-            logits[:, -1] = torch.tensor([float("nan"), float("inf"), float("-inf")])
+            logits[:] = torch.tensor([float("nan"), float("inf"), float("-inf")])
             return logits, torch.zeros(batch, seq_len)
 
     obs_ctx = deque([np.zeros((7, 7, 3), dtype=np.uint8)], maxlen=4)

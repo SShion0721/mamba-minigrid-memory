@@ -67,11 +67,13 @@ class MiniGridSpatialEncoder(nn.Module):
         spatial_heads: int = 4,
         dropout: float = 0.0,
         encoder_type: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.spatial_layers = spatial_layers
         self.encoder_type = encoder_type
+        self.slot_count = max(0, int(slot_count))
 
         self.obj_emb = nn.Embedding(32, 24)
         self.color_emb = nn.Embedding(16, 16)
@@ -81,6 +83,14 @@ class MiniGridSpatialEncoder(nn.Module):
         self.direction_emb = nn.Embedding(4, d_model)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_emb = nn.Parameter(torch.zeros(1, 49, d_model))
+        if self.slot_count > 0:
+            self.slot_queries = nn.Parameter(torch.zeros(1, self.slot_count, d_model))
+            self.slot_source_norm = nn.LayerNorm(d_model)
+            self.slot_norm = nn.LayerNorm(d_model)
+        else:
+            self.register_parameter("slot_queries", None)
+            self.slot_source_norm = None
+            self.slot_norm = None
 
         if encoder_type == "transformer" and spatial_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -131,8 +141,18 @@ class MiniGridSpatialEncoder(nn.Module):
 
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        if self.slot_queries is not None:
+            nn.init.trunc_normal_(self.slot_queries, std=0.02)
 
     def forward(self, obs: torch.Tensor, direction: torch.Tensor | None = None) -> torch.Tensor:
+        out, _ = self.forward_tokens(obs, direction)
+        return out
+
+    def forward_tokens(
+        self,
+        obs: torch.Tensor,
+        direction: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Accept obs [B, 7, 7, 3] or [B, T, 7, 7, 3]."""
 
         has_time = obs.ndim == 5
@@ -162,6 +182,7 @@ class MiniGridSpatialEncoder(nn.Module):
         if self.spatial is None:
             if self.encoder_type == "transformer":
                 out = self.flat(torch.cat([cells.reshape(num_items, -1), direction_token.squeeze(1)], dim=-1))
+                slot_source = cells
             else:
                 grid = cells.transpose(1, 2).reshape(num_items, self.d_model, 7, 7)
                 for block in self.conv_blocks:
@@ -171,13 +192,27 @@ class MiniGridSpatialEncoder(nn.Module):
                 salient = (tokens * weights).sum(dim=1)
                 mean = tokens.mean(dim=1)
                 out = self.out_norm(self.summary(torch.cat([salient, mean, direction_token.squeeze(1)], dim=-1)))
+                slot_source = tokens
         else:
-            tokens = torch.cat([cls, cells], dim=1)
-            out = self.out_norm(self.spatial(tokens)[:, 0])
+            tokens = self.spatial(torch.cat([cls, cells], dim=1))
+            out = self.out_norm(tokens[:, 0])
+            slot_source = tokens[:, 1:]
+
+        slots = self._extract_slots(slot_source, direction_token)
 
         if has_time:
             out = out.reshape(batch, seq_len, self.d_model)
-        return out
+            if slots is not None:
+                slots = slots.reshape(batch, seq_len, self.slot_count, self.d_model)
+        return out, slots
+
+    def _extract_slots(self, tokens: torch.Tensor, direction_token: torch.Tensor) -> torch.Tensor | None:
+        if self.slot_count <= 0:
+            return None
+        queries = self.slot_queries.expand(tokens.shape[0], -1, -1) + direction_token
+        source = self.slot_source_norm(tokens)
+        weights = torch.softmax(torch.matmul(queries, source.transpose(-2, -1)) / math.sqrt(self.d_model), dim=-1)
+        return self.slot_norm(torch.matmul(weights, tokens))
 
 
 class _SpatialConvBlock(nn.Module):
@@ -211,14 +246,18 @@ class TokenEncoder(nn.Module):
         spatial_heads: int = 4,
         dropout: float = 0.0,
         spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
+        self.slot_count = max(0, int(slot_count))
+        self.tokens_per_step = self.slot_count + 1
         self.obs_encoder = MiniGridSpatialEncoder(
             d_model=d_model,
             spatial_layers=spatial_layers,
             spatial_heads=spatial_heads,
             dropout=dropout,
             encoder_type=spatial_encoder,
+            slot_count=self.slot_count,
         )
         self.action_proj = layer_init(nn.Linear(action_dim, d_model))
         self.reward_proj = layer_init(nn.Linear(1, d_model))
@@ -233,15 +272,46 @@ class TokenEncoder(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = (
-            self.obs_encoder(obs_seq, direction_seq)
-            + self.action_proj(prev_action_seq.float())
+        return_valid_mask: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        spatial, slots = self.obs_encoder.forward_tokens(obs_seq, direction_seq)
+        side = (
+            self.action_proj(prev_action_seq.float())
             + self.reward_proj(prev_reward_seq.float())
             + self.start_proj(episode_start_seq.float())
         )
+        if slots is None:
+            x = spatial + side
+            token_valid_mask = valid_mask
+        else:
+            slot_tokens = slots + side.unsqueeze(-2)
+            global_token = (spatial + side).unsqueeze(-2)
+            x = torch.cat([slot_tokens, global_token], dim=-2)
+            batch, seq_len, tokens_per_step, d_model = x.shape
+            x = x.reshape(batch, seq_len * tokens_per_step, d_model)
+            token_valid_mask = None
+            if valid_mask is not None:
+                token_valid_mask = (
+                    valid_mask.to(device=x.device)
+                    .unsqueeze(-1)
+                    .expand(-1, -1, tokens_per_step)
+                    .reshape(batch, seq_len * tokens_per_step)
+                )
         x = self.token_norm(x)
-        return _apply_valid_mask(x, valid_mask)
+        x = _apply_valid_mask(x, token_valid_mask)
+        if return_valid_mask:
+            return x, token_valid_mask
+        return x
+
+    def decision_tokens(self, x: torch.Tensor, time_steps: int) -> torch.Tensor:
+        if self.tokens_per_step == 1:
+            return x[:, :time_steps]
+        return x[:, self.slot_count :: self.tokens_per_step][:, :time_steps]
+
+    def expand_lengths(self, lengths: torch.Tensor | None) -> torch.Tensor | None:
+        if lengths is None:
+            return None
+        return lengths * self.tokens_per_step
 
 
 class GRUGate(nn.Module):
@@ -392,6 +462,7 @@ class MLPActorCritic(nn.Module):
         dropout: float = 0.0,
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -462,6 +533,7 @@ class LSTMActorCritic(nn.Module):
         dropout: float = 0.0,
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -473,6 +545,7 @@ class LSTMActorCritic(nn.Module):
             spatial_heads=spatial_heads,
             dropout=dropout,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
         self.lstm = nn.LSTM(
             input_size=d_model,
@@ -492,10 +565,34 @@ class LSTMActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
-        x, _ = self.lstm(x)
+        time_steps = obs_seq.shape[1]
+        x, token_valid_mask = self.token_encoder(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask,
+            return_valid_mask=True,
+        )
+        token_lengths = self.token_encoder.expand_lengths(_resolve_lengths(valid_mask, lengths, time_steps))
+        token_seq_len = x.shape[1]
+        if token_lengths is not None:
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x,
+                token_lengths.detach().to("cpu"),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            x, _ = self.lstm(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=token_seq_len)
+        else:
+            x, _ = self.lstm(x)
         x = self.norm(x)
+        x = _apply_valid_mask(x, token_valid_mask)
+        x = self.token_encoder.decision_tokens(x, time_steps)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def get_action_and_value(
@@ -507,6 +604,7 @@ class LSTMActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(
             obs_seq,
@@ -515,11 +613,117 @@ class LSTMActorCritic(nn.Module):
             prev_reward_seq,
             episode_start_seq,
             valid_mask=valid_mask,
+            lengths=lengths,
         )
-        dist = _safe_categorical(logits[:, -1])
+        last_logits = _gather_last_valid(logits, valid_mask)
+        last_values = _gather_last_valid(values, valid_mask)
+        dist = _safe_categorical(last_logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+        return action, dist.log_prob(action), dist.entropy(), last_values
+
+
+class GRUActorCritic(nn.Module):
+    """GRU recurrent PPO baseline with the shared spatial/token encoder."""
+
+    def __init__(
+        self,
+        action_dim: int = 7,
+        d_model: int = 128,
+        n_layers: int = 1,
+        spatial_layers: int = 2,
+        spatial_heads: int = 4,
+        dropout: float = 0.0,
+        valid_actions: list[int] | None = None,
+        spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        _register_action_mask(self, action_dim, valid_actions)
+        self.token_encoder = TokenEncoder(
+            action_dim=action_dim,
+            d_model=d_model,
+            spatial_layers=spatial_layers,
+            spatial_heads=spatial_heads,
+            dropout=dropout,
+            spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
+        )
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=n_layers,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+
+    def forward(
+        self,
+        obs_seq: torch.Tensor,
+        direction_seq: torch.Tensor,
+        prev_action_seq: torch.Tensor,
+        prev_reward_seq: torch.Tensor,
+        episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        time_steps = obs_seq.shape[1]
+        x, token_valid_mask = self.token_encoder(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask,
+            return_valid_mask=True,
+        )
+        token_lengths = self.token_encoder.expand_lengths(_resolve_lengths(valid_mask, lengths, time_steps))
+        token_seq_len = x.shape[1]
+        if token_lengths is not None:
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x,
+                token_lengths.detach().to("cpu"),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            x, _ = self.gru(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=token_seq_len)
+        else:
+            x, _ = self.gru(x)
+        x = self.norm(x)
+        x = _apply_valid_mask(x, token_valid_mask)
+        x = self.token_encoder.decision_tokens(x, time_steps)
+        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+
+    def get_action_and_value(
+        self,
+        obs_seq: torch.Tensor,
+        direction_seq: torch.Tensor,
+        prev_action_seq: torch.Tensor,
+        prev_reward_seq: torch.Tensor,
+        episode_start_seq: torch.Tensor,
+        action: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, values = self.forward(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask=valid_mask,
+            lengths=lengths,
+        )
+        last_logits = _gather_last_valid(logits, valid_mask)
+        last_values = _gather_last_valid(values, valid_mask)
+        dist = _safe_categorical(last_logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), last_values
 
 
 class MambaActorCritic(nn.Module):
@@ -543,6 +747,7 @@ class MambaActorCritic(nn.Module):
         dropout: float = 0.0,
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
         block_cls = _resolve_mamba_block(variant)
@@ -564,6 +769,7 @@ class MambaActorCritic(nn.Module):
             spatial_heads=spatial_heads,
             dropout=dropout,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
         self.blocks = nn.ModuleList(
             [
@@ -599,13 +805,25 @@ class MambaActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
+        time_steps = obs_seq.shape[1]
+        x, token_valid_mask = self.token_encoder(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask,
+            return_valid_mask=True,
+        )
         for norm, block in zip(self.block_norms, self.blocks):
             out = block(norm(x))
             _raise_if_nonfinite(out, "Mamba block output")
             x = x + self.residual_scale * out
         x = self.norm(x)
+        x = _apply_valid_mask(x, token_valid_mask)
+        x = self.token_encoder.decision_tokens(x, time_steps)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def init_inference_state(
@@ -647,21 +865,26 @@ class MambaActorCritic(nn.Module):
         inference_state: list[tuple[torch.Tensor, ...]],
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, ...]]]:
-        x = self.token_encoder(
+        x_tokens = self.token_encoder(
             obs.unsqueeze(1),
             direction.unsqueeze(1),
             prev_action.unsqueeze(1),
             prev_reward.unsqueeze(1),
             episode_start.unsqueeze(1),
         )
-        new_state: list[tuple[torch.Tensor, ...]] = []
-        for cache, norm, block in zip(inference_state, self.block_norms, self.blocks):
-            out = block.step(norm(x), *cache)
-            block_out = out[0]
-            block_cache = tuple(out[1:])
-            _raise_if_nonfinite(block_out, "Mamba step output")
-            x = x + self.residual_scale * block_out
-            new_state.append(block_cache)
+        current_state = inference_state
+        x = x_tokens[:, -1:]
+        for token_idx in range(x_tokens.shape[1]):
+            x = x_tokens[:, token_idx : token_idx + 1]
+            new_state: list[tuple[torch.Tensor, ...]] = []
+            for cache, norm, block in zip(current_state, self.block_norms, self.blocks):
+                out = block.step(norm(x), *cache)
+                block_out = out[0]
+                block_cache = tuple(out[1:])
+                _raise_if_nonfinite(block_out, "Mamba step output")
+                x = x + self.residual_scale * block_out
+                new_state.append(block_cache)
+            current_state = new_state
 
         x = self.norm(x)
         logits = _mask_logits(self, self.actor(x[:, -1]))
@@ -669,7 +892,7 @@ class MambaActorCritic(nn.Module):
         dist = _safe_categorical(logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value, new_state
+        return action, dist.log_prob(action), dist.entropy(), value, current_state
 
     def get_action_and_value(
         self,
@@ -680,6 +903,7 @@ class MambaActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(
             obs_seq,
@@ -688,11 +912,14 @@ class MambaActorCritic(nn.Module):
             prev_reward_seq,
             episode_start_seq,
             valid_mask=valid_mask,
+            lengths=lengths,
         )
-        dist = _safe_categorical(logits[:, -1])
+        last_logits = _gather_last_valid(logits, valid_mask)
+        last_values = _gather_last_valid(values, valid_mask)
+        dist = _safe_categorical(last_logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+        return action, dist.log_prob(action), dist.entropy(), last_values
 
 
 class FastGatedAttentionActorCritic(nn.Module):
@@ -710,13 +937,13 @@ class FastGatedAttentionActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         position_mode: str = "learned",
+        slot_count: int = 0,
     ):
         super().__init__()
         if position_mode not in {"learned", "none", "alibi"}:
             raise ValueError("position_mode must be one of: learned, none, alibi.")
         self.action_dim = action_dim
         _register_action_mask(self, action_dim, valid_actions)
-        self.context_len = context_len
         self.position_mode = position_mode
         self.n_heads = n_heads
         self.d_model = d_model
@@ -724,10 +951,13 @@ class FastGatedAttentionActorCritic(nn.Module):
         self.token_encoder = TokenEncoder(
             action_dim=action_dim, d_model=d_model, spatial_layers=spatial_layers,
             spatial_heads=spatial_heads, dropout=dropout, spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
+        self.time_context_len = context_len
+        self.context_len = context_len * self.token_encoder.tokens_per_step
         
         if self.position_mode == "learned":
-            self.temporal_pos = nn.Parameter(torch.zeros(1, context_len, d_model))
+            self.temporal_pos = nn.Parameter(torch.zeros(1, self.context_len, d_model))
             nn.init.trunc_normal_(self.temporal_pos, std=0.02)
         else:
             self.register_parameter("temporal_pos", None)
@@ -754,9 +984,19 @@ class FastGatedAttentionActorCritic(nn.Module):
         prev_reward_seq,
         episode_start_seq,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
+        time_steps = obs_seq.shape[1]
+        x, token_valid_mask = self.token_encoder(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask,
+            return_valid_mask=True,
+        )
         seq_len = x.shape[1]
         
         if seq_len > self.context_len:
@@ -764,14 +1004,15 @@ class FastGatedAttentionActorCritic(nn.Module):
             
         if self.temporal_pos is not None:
             x = x + self.temporal_pos[:, -seq_len:]
-            x = _apply_valid_mask(x, valid_mask)
+            x = _apply_valid_mask(x, token_valid_mask)
         
         # 前向传播过 Gated Blocks
         for block in self.blocks:
-            x = block(x, is_causal=True, alibi_slopes=self.alibi_slopes, valid_mask=valid_mask)
+            x = block(x, is_causal=True, alibi_slopes=self.alibi_slopes, valid_mask=token_valid_mask)
             
         x = self.norm(x)
-        x = _apply_valid_mask(x, valid_mask)
+        x = _apply_valid_mask(x, token_valid_mask)
+        x = self.token_encoder.decision_tokens(x, time_steps)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def get_action_and_value(
@@ -783,6 +1024,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         episode_start_seq,
         action=None,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ):
         logits, values = self.forward(
             obs_seq,
@@ -791,11 +1033,14 @@ class FastGatedAttentionActorCritic(nn.Module):
             prev_reward_seq,
             episode_start_seq,
             valid_mask=valid_mask,
+            lengths=lengths,
         )
-        dist = _safe_categorical(logits[:, -1])
+        last_logits = _gather_last_valid(logits, valid_mask)
+        last_values = _gather_last_valid(values, valid_mask)
+        dist = _safe_categorical(last_logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+        return action, dist.log_prob(action), dist.entropy(), last_values
 
     def init_inference_state(
         self,
@@ -846,17 +1091,22 @@ class FastGatedAttentionActorCritic(nn.Module):
         inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-        x = self.token_encoder(
+        x_tokens = self.token_encoder(
             obs.unsqueeze(1),
             direction.unsqueeze(1),
             prev_action.unsqueeze(1),
             prev_reward.unsqueeze(1),
             episode_start.unsqueeze(1),
         )
-        new_state = []
-        for block, cache in zip(self.blocks, inference_state):
-            x, cache = block.forward_step(x, cache, alibi_slopes=self.alibi_slopes)
-            new_state.append(cache)
+        current_state = inference_state
+        x = x_tokens[:, -1:]
+        for token_idx in range(x_tokens.shape[1]):
+            x = x_tokens[:, token_idx : token_idx + 1]
+            new_state = []
+            for block, cache in zip(self.blocks, current_state):
+                x, cache = block.forward_step(x, cache, alibi_slopes=self.alibi_slopes)
+                new_state.append(cache)
+            current_state = new_state
 
         x = self.norm(x)
         logits = _mask_logits(self, self.actor(x[:, -1]))
@@ -864,7 +1114,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         dist = _safe_categorical(logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value, new_state
+        return action, dist.log_prob(action), dist.entropy(), value, current_state
     
 class AttentionActorCritic(nn.Module):
     """Spatial-attention + causal temporal-attention actor critic."""
@@ -881,11 +1131,11 @@ class AttentionActorCritic(nn.Module):
         dropout: float = 0.0,
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
+        slot_count: int = 0,
     ):
         super().__init__()
         self.action_dim = action_dim
         _register_action_mask(self, action_dim, valid_actions)
-        self.context_len = context_len
         self.n_heads = n_heads
         self.token_encoder = TokenEncoder(
             action_dim=action_dim,
@@ -894,8 +1144,11 @@ class AttentionActorCritic(nn.Module):
             spatial_heads=spatial_heads,
             dropout=dropout,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
-        self.temporal_pos = nn.Parameter(torch.zeros(1, context_len, d_model))
+        self.time_context_len = context_len
+        self.context_len = context_len * self.token_encoder.tokens_per_step
+        self.temporal_pos = nn.Parameter(torch.zeros(1, self.context_len, d_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -919,20 +1172,31 @@ class AttentionActorCritic(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq, valid_mask)
+        time_steps = obs_seq.shape[1]
+        x, token_valid_mask = self.token_encoder(
+            obs_seq,
+            direction_seq,
+            prev_action_seq,
+            prev_reward_seq,
+            episode_start_seq,
+            valid_mask,
+            return_valid_mask=True,
+        )
         seq_len = x.shape[1]
         if seq_len > self.context_len:
             raise ValueError(f"Sequence length {seq_len} exceeds context_len {self.context_len}.")
         x = x + self.temporal_pos[:, -seq_len:]
-        x = _apply_valid_mask(x, valid_mask)
-        mask = _temporal_attention_mask(valid_mask, seq_len, self.n_heads, x.device, x.dtype)
+        x = _apply_valid_mask(x, token_valid_mask)
+        mask = _temporal_attention_mask(token_valid_mask, seq_len, self.n_heads, x.device, x.dtype)
         if mask is None:
             mask = _causal_mask(seq_len, x.device)
         x = self.temporal(x, mask=mask)
-        x = _apply_valid_mask(torch.nan_to_num(x), valid_mask)
+        x = _apply_valid_mask(torch.nan_to_num(x), token_valid_mask)
         x = self.norm(x)
-        x = _apply_valid_mask(x, valid_mask)
+        x = _apply_valid_mask(x, token_valid_mask)
+        x = self.token_encoder.decision_tokens(x, time_steps)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
 
     def get_action_and_value(
@@ -944,6 +1208,7 @@ class AttentionActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         action: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, values = self.forward(
             obs_seq,
@@ -952,11 +1217,14 @@ class AttentionActorCritic(nn.Module):
             prev_reward_seq,
             episode_start_seq,
             valid_mask=valid_mask,
+            lengths=lengths,
         )
-        dist = _safe_categorical(logits[:, -1])
+        last_logits = _gather_last_valid(logits, valid_mask)
+        last_values = _gather_last_valid(values, valid_mask)
+        dist = _safe_categorical(last_logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+        return action, dist.log_prob(action), dist.entropy(), last_values
 
 
 def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
@@ -970,6 +1238,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
     spatial_encoder = getattr(cfg, "spatial_encoder", "transformer")
     dropout = getattr(cfg, "dropout", 0.0)
     valid_actions = _parse_valid_actions(getattr(cfg, "valid_actions", None))
+    slot_count = getattr(cfg, "slot_count", 0)
 
     if model_name == "mlp":
         return MLPActorCritic(
@@ -991,6 +1260,19 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             dropout=dropout,
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
+        )
+    if model_name == "gru":
+        return GRUActorCritic(
+            action_dim=action_dim,
+            d_model=d_model,
+            n_layers=getattr(cfg, "gru_layers", getattr(cfg, "lstm_layers", 1)),
+            spatial_layers=spatial_layers,
+            spatial_heads=spatial_heads,
+            dropout=dropout,
+            valid_actions=valid_actions,
+            spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
     if model_name == "mamba":
         return MambaActorCritic(
@@ -1010,6 +1292,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             dropout=dropout,
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
     if model_name == "attention":
         return AttentionActorCritic(
@@ -1023,6 +1306,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             dropout=dropout,
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
+            slot_count=slot_count,
         )
     if model_name == "gated_attention":
         return FastGatedAttentionActorCritic(
@@ -1037,6 +1321,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
             position_mode=getattr(cfg, "gated_attention_pos", "learned"),
+            slot_count=slot_count,
         )
     
 
@@ -1152,6 +1437,26 @@ def _apply_valid_mask(x: torch.Tensor, valid_mask: torch.Tensor | None) -> torch
     if valid_mask is None:
         return x
     return x * valid_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+
+
+def _resolve_lengths(
+    valid_mask: torch.Tensor | None,
+    lengths: torch.Tensor | None,
+    seq_len: int,
+) -> torch.Tensor | None:
+    if lengths is not None:
+        return lengths.to(dtype=torch.long).clamp(min=1, max=seq_len)
+    if valid_mask is None:
+        return None
+    return valid_mask.to(dtype=torch.long).sum(dim=1).clamp(min=1, max=seq_len)
+
+
+def _gather_last_valid(x: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+    if valid_mask is None:
+        return x[:, -1]
+    indices = valid_mask.to(device=x.device).long().sum(dim=1).clamp(min=1, max=x.shape[1]) - 1
+    rows = torch.arange(x.shape[0], device=x.device)
+    return x[rows, indices]
 
 
 def _causal_attention_bias(seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

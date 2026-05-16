@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import importlib.metadata
+import json
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -36,7 +39,7 @@ from src.envs import MEMORY_ENVS, make_env
 from src.models import build_actor_critic
 from src.ppo import PPOTrainer, RolloutBuffer
 
-SEQUENCE_MODELS = {"mamba", "lstm", "attention", "gated_attention"}
+SEQUENCE_MODELS = {"mamba", "lstm", "gru", "attention", "gated_attention"}
 
 
 @dataclass
@@ -76,6 +79,7 @@ class Config:
     spatial_heads: int = 4
     dropout: float = 0.0
     lstm_layers: int = 1
+    gru_layers: int = 1
     mamba_variant: str = "mamba"
     mamba_layers: int = 2
     d_state: int = 16
@@ -88,10 +92,17 @@ class Config:
     attention_layers: int = 2
     attention_heads: int = 4
     gated_attention_pos: str = "learned"
+    slot_count: int = 4
     valid_actions: str = "0,1,2"
     stateful_rollout: bool = True
     torch_compile: bool = False
     amp: str = "none"
+    allow_legacy_load: bool = False
+
+    curriculum: bool = False
+    curriculum_envs: str = "MiniGrid-MemoryS11-v0,MiniGrid-MemoryS13-v0,MiniGrid-MemoryS13Random-v0,MiniGrid-MemoryS17Random-v0"
+    curriculum_thresholds: str = "0.90,0.85,0.80"
+    curriculum_patience: int = 3
 
     eval_interval: int = 20_000
     eval_episodes: int = 30
@@ -116,6 +127,13 @@ def train(config: Config) -> None:
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
+
+    curriculum_envs = _parse_str_list(config.curriculum_envs) if config.curriculum else [config.env_id]
+    curriculum_thresholds = _parse_float_list(config.curriculum_thresholds)
+    curriculum_stage = 0
+    curriculum_hits = 0
+    if config.curriculum:
+        config.env_id = curriculum_envs[0]
 
     run_name = config.run_name or _default_run_name(config)
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -148,9 +166,13 @@ def train(config: Config) -> None:
 
     model = build_actor_critic(config, action_dim=action_dim).to(device)
     if config.resume_from:
-        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if missing or unexpected:
+        missing, unexpected = model.load_state_dict(
+            ckpt["model_state_dict"],
+            strict=not config.allow_legacy_load,
+        )
+        if config.allow_legacy_load and (missing or unexpected):
             print(f"Checkpoint loaded with missing={missing} unexpected={unexpected}")
+    _write_run_config(run_dir, config, action_dim)
 
     if config.torch_compile:
         if hasattr(torch, "compile"):
@@ -306,7 +328,7 @@ def train(config: Config) -> None:
                                 torch.as_tensor(episode_start_buf, device=device),
                                 mamba_inference_state,
                             )
-                    except (AssertionError, NotImplementedError, RuntimeError) as exc:
+                    except (AssertionError, FloatingPointError, NotImplementedError, RuntimeError) as exc:
                         use_stateful_rollout = False
                         mamba_inference_state = None
                         tqdm.write(
@@ -327,6 +349,7 @@ def train(config: Config) -> None:
                                 torch.as_tensor(context[2], device=device),
                                 torch.as_tensor(context[3], device=device),
                                 torch.as_tensor(context[4], device=device),
+                                valid_mask=torch.as_tensor(context[5], device=device),
                             )
                 elif config.model in SEQUENCE_MODELS:
                     context = buffer.get_context(
@@ -343,6 +366,7 @@ def train(config: Config) -> None:
                             torch.as_tensor(context[2], device=device),
                             torch.as_tensor(context[3], device=device),
                             torch.as_tensor(context[4], device=device),
+                            valid_mask=torch.as_tensor(context[5], device=device),
                         )
                 else:
                     with torch.no_grad(), _autocast_context(device, amp_dtype):
@@ -545,6 +569,7 @@ def train(config: Config) -> None:
                 writer.add_scalar("eval/success_rate", success_rate, global_step)
                 writer.add_scalar("eval/mean_return", mean_return, global_step)
                 writer.add_scalar("eval/mean_length", mean_length, global_step)
+                writer.add_scalar("curriculum/stage", curriculum_stage, global_step)
                 tqdm.write(
                     f"Eval step {global_step:>9d} | "
                     f"success {success_rate:>6.2%} | "
@@ -552,6 +577,55 @@ def train(config: Config) -> None:
                     f"len {mean_length:>5.1f} | "
                     f"SPS {sps}"
                 )
+                if config.curriculum and curriculum_stage < len(curriculum_envs) - 1:
+                    threshold = curriculum_thresholds[min(curriculum_stage, len(curriculum_thresholds) - 1)]
+                    curriculum_hits = curriculum_hits + 1 if success_rate >= threshold else 0
+                    writer.add_scalar("curriculum/hits", curriculum_hits, global_step)
+                    if curriculum_hits >= config.curriculum_patience:
+                        curriculum_stage += 1
+                        curriculum_hits = 0
+                        config.env_id = curriculum_envs[curriculum_stage]
+                        tqdm.write(f"Curriculum advanced to stage {curriculum_stage}: {config.env_id}")
+                        for env in envs:
+                            env.close()
+                        envs = [
+                            make_env(
+                                config.env_id,
+                                seed=config.seed + 10_000 * (curriculum_stage + 1) + i,
+                                spinning_penalty=config.spinning_penalty,
+                                spinning_threshold=config.spinning_threshold,
+                            )
+                            for i in range(config.num_envs)
+                        ]
+                        _reset_env_buffers(
+                            envs,
+                            config,
+                            obs_buf,
+                            direction_buf,
+                            prev_action_buf,
+                            prev_reward_buf,
+                            episode_start_buf,
+                            seed_offset=10_000 * (curriculum_stage + 1),
+                        )
+                        buffer = RolloutBuffer(
+                            num_envs=config.num_envs,
+                            num_steps=config.num_steps,
+                            obs_shape=obs_shape,
+                            action_dim=action_dim,
+                            context_len=config.context_len,
+                        )
+                        episode_returns.fill(0.0)
+                        episode_lengths.fill(0)
+                        recent_returns.clear()
+                        recent_lengths.clear()
+                        recent_successes.clear()
+                        if use_stateful_rollout:
+                            mamba_inference_state = model.init_inference_state(
+                                config.num_envs,
+                                device=device,
+                                dtype=amp_dtype or _model_parameter_dtype(model),
+                            )
+                        _write_run_config(run_dir, config, action_dim)
                 next_eval += config.eval_interval
 
             if global_step >= next_save:
@@ -680,6 +754,26 @@ def evaluate(
     )
 
 
+def _reset_env_buffers(
+    envs,
+    config: Config,
+    obs_buf: np.ndarray,
+    direction_buf: np.ndarray,
+    prev_action_buf: np.ndarray,
+    prev_reward_buf: np.ndarray,
+    episode_start_buf: np.ndarray,
+    *,
+    seed_offset: int = 0,
+) -> None:
+    for env_idx, env in enumerate(envs):
+        obs_dict, _ = env.reset(seed=config.seed + seed_offset + env_idx)
+        obs_buf[env_idx] = obs_dict["obs"]
+        direction_buf[env_idx] = obs_dict["direction"]
+        prev_action_buf[env_idx] = obs_dict["prev_action"]
+        prev_reward_buf[env_idx] = obs_dict["prev_reward"]
+        episode_start_buf[env_idx] = obs_dict["episode_start"]
+
+
 def _bootstrap_value(
     model,
     config: Config,
@@ -700,6 +794,7 @@ def _bootstrap_value(
                 torch.as_tensor(context[2], device=device),
                 torch.as_tensor(context[3], device=device),
                 torch.as_tensor(context[4], device=device),
+                valid_mask=torch.as_tensor(context[5], device=device),
             )
             return values[:, -1].float().cpu().numpy()
 
@@ -726,7 +821,7 @@ def _select_sequence_action(
     *,
     greedy: bool,
 ) -> int:
-    obs_seq, dir_seq, act_seq, rew_seq, start_seq = _pack_context(
+    obs_seq, dir_seq, act_seq, rew_seq, start_seq, valid_mask = _pack_context(
         obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx, context_len, action_dim
     )
     with torch.no_grad():
@@ -736,8 +831,11 @@ def _select_sequence_action(
             torch.as_tensor(act_seq, device=device),
             torch.as_tensor(rew_seq, device=device),
             torch.as_tensor(start_seq, device=device),
+            valid_mask=torch.as_tensor(valid_mask, device=device),
         )
-        last_logits = logits[:, -1]
+        mask_t = torch.as_tensor(valid_mask, device=device)
+        last_idx = mask_t.long().sum(dim=1).clamp(min=1, max=logits.shape[1]) - 1
+        last_logits = logits[torch.arange(logits.shape[0], device=device), last_idx]
         if greedy:
             return torch.argmax(last_logits, dim=-1).item()
         return Categorical(logits=last_logits).sample().item()
@@ -751,7 +849,7 @@ def _pack_context(
     start_ctx: deque,
     context_len: int,
     action_dim: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(obs_ctx)
     obs_shape = np.asarray(obs_ctx[0]).shape if n else (7, 7, 3)
     obs_seq = np.zeros((1, context_len, *obs_shape), dtype=np.uint8)
@@ -759,15 +857,17 @@ def _pack_context(
     act_seq = np.zeros((1, context_len, action_dim), dtype=np.float32)
     rew_seq = np.zeros((1, context_len, 1), dtype=np.float32)
     start_seq = np.zeros((1, context_len, 1), dtype=np.float32)
+    valid_mask = np.zeros((1, context_len), dtype=np.float32)
 
     if n:
-        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.uint8)
-        dir_seq[0, -n:] = np.asarray(list(dir_ctx), dtype=np.int64)
-        act_seq[0, -n:] = np.asarray(list(act_ctx), dtype=np.float32)
-        rew_seq[0, -n:] = np.asarray(list(rew_ctx), dtype=np.float32)
-        start_seq[0, -n:] = np.asarray(list(start_ctx), dtype=np.float32)
+        obs_seq[0, :n] = np.asarray(list(obs_ctx), dtype=np.uint8)
+        dir_seq[0, :n] = np.asarray(list(dir_ctx), dtype=np.int64)
+        act_seq[0, :n] = np.asarray(list(act_ctx), dtype=np.float32)
+        rew_seq[0, :n] = np.asarray(list(rew_ctx), dtype=np.float32)
+        start_seq[0, :n] = np.asarray(list(start_ctx), dtype=np.float32)
+        valid_mask[0, :n] = 1.0
 
-    return obs_seq, dir_seq, act_seq, rew_seq, start_seq
+    return obs_seq, dir_seq, act_seq, rew_seq, start_seq, valid_mask
 
 
 def _save_checkpoint(
@@ -780,16 +880,77 @@ def _save_checkpoint(
     action_dim: int,
 ) -> None:
     config_dict = asdict(config)
-    config_dict["action_dim"] = action_dim
+    config_dict["action_dim"] = int(action_dim)
     state = {
+        "checkpoint_schema_version": 2,
         "model_state_dict": _model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "config_dict": config_dict,
+        "runtime_metadata": _runtime_metadata(config, action_dim),
         "global_step": global_step,
     }
     if scheduler is not None:
         state["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(state, path)
+
+
+def _write_run_config(run_dir: str, config: Config, action_dim: int) -> None:
+    path = os.path.join(run_dir, "run_config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(_runtime_metadata(config, action_dim), fh, indent=2, sort_keys=True, default=_json_default)
+
+
+def _runtime_metadata(config: Config, action_dim: int) -> dict:
+    return {
+        "checkpoint_schema_version": 2,
+        "config": asdict(config),
+        "action_dim": int(action_dim),
+        "git_commit": _git_commit(),
+        "packages": _package_versions(
+            "torch",
+            "gymnasium",
+            "minigrid",
+            "mamba-ssm",
+            "causal-conv1d",
+            "triton",
+            "triton-windows",
+        ),
+        "cuda_available": torch.cuda.is_available(),
+        "torch_cuda": getattr(torch.version, "cuda", None),
+        "actual_mamba_variant": config.mamba_variant if config.model == "mamba" else None,
+    }
+
+
+def _git_commit() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _package_versions(*names: str) -> dict[str, str | None]:
+    versions = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.dtype):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _default_run_name(config: Config) -> str:
@@ -798,6 +959,15 @@ def _default_run_name(config: Config) -> str:
     if config.model == "mamba" and config.mamba_variant != "mamba":
         model_name = config.mamba_variant
     return f"{model_name}_{env_name}_seed{config.seed}"
+
+
+def _parse_str_list(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_float_list(value: str) -> list[float]:
+    values = [float(part) for part in value.split(",") if part.strip()]
+    return values or [1.0]
 
 
 def _format_config(config: Config) -> str:
@@ -845,6 +1015,7 @@ def _apply_checkpoint_arch_config(config: Config, ckpt) -> None:
         "spatial_encoder",
         "spatial_layers",
         "spatial_heads",
+        "slot_count",
         "mamba_variant",
         "mamba_layers",
         "d_model",
@@ -857,6 +1028,7 @@ def _apply_checkpoint_arch_config(config: Config, ckpt) -> None:
         "mamba_rope_fraction",
         "attention_layers",
         "attention_heads",
+        "gru_layers",
         "gated_attention_pos",
         "valid_actions",
     )
@@ -938,7 +1110,7 @@ def _progress_status(
 def parse_args(default_model: str = "mamba") -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-id", type=str, default="MiniGrid-MemoryS11-v0")
-    parser.add_argument("--model", type=str, default=default_model, choices=["mamba", "attention", "lstm", "mlp", "gated_attention"])
+    parser.add_argument("--model", type=str, default=default_model, choices=["mamba", "attention", "lstm", "gru", "mlp", "gated_attention"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--lr", type=float, default=2.5e-4)
@@ -971,6 +1143,7 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--spatial-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--lstm-layers", type=int, default=1)
+    parser.add_argument("--gru-layers", type=int, default=1)
     parser.add_argument("--mamba-variant", type=str, default="mamba", choices=["mamba", "mamba2", "mamba3"])
     parser.add_argument("--mamba-layers", type=int, default=2)
     parser.add_argument("--d-state", type=int, default=16)
@@ -983,6 +1156,7 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--gated-attention-pos", type=str, default="learned", choices=["learned", "none", "alibi"])
+    parser.add_argument("--slot-count", type=int, default=4, help="Number of learned spatial slot tokens per step before the global decision token.")
     parser.add_argument(
         "--valid-actions",
         type=str,
@@ -998,6 +1172,13 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--compile", dest="torch_compile", action="store_true", help="Compile model.forward with torch.compile")
     parser.set_defaults(torch_compile=False)
     parser.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
+    parser.add_argument("--allow-legacy-load", action="store_true", help="Load checkpoints with strict=False for old, schema-less experiments.")
+    parser.set_defaults(allow_legacy_load=False)
+    parser.add_argument("--curriculum", action="store_true", help="Train through the Memory curriculum S11 -> S13 -> S13Random -> S17Random.")
+    parser.set_defaults(curriculum=False)
+    parser.add_argument("--curriculum-envs", type=str, default="MiniGrid-MemoryS11-v0,MiniGrid-MemoryS13-v0,MiniGrid-MemoryS13Random-v0,MiniGrid-MemoryS17Random-v0")
+    parser.add_argument("--curriculum-thresholds", type=str, default="0.90,0.85,0.80")
+    parser.add_argument("--curriculum-patience", type=int, default=3)
     parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
     parser.set_defaults(progress_bar=True)
     parser.add_argument("--run-name", type=str, default="")
@@ -1036,6 +1217,7 @@ def parse_args(default_model: str = "mamba") -> Config:
         spatial_heads=args.spatial_heads,
         dropout=args.dropout,
         lstm_layers=args.lstm_layers,
+        gru_layers=args.gru_layers,
         mamba_variant=args.mamba_variant,
         mamba_layers=args.mamba_layers,
         d_state=args.d_state,
@@ -1048,10 +1230,16 @@ def parse_args(default_model: str = "mamba") -> Config:
         attention_layers=args.attention_layers,
         attention_heads=args.attention_heads,
         gated_attention_pos=args.gated_attention_pos,
+        slot_count=args.slot_count,
         valid_actions=args.valid_actions,
         stateful_rollout=args.stateful_rollout,
         torch_compile=args.torch_compile,
         amp=args.amp,
+        allow_legacy_load=args.allow_legacy_load,
+        curriculum=args.curriculum,
+        curriculum_envs=args.curriculum_envs,
+        curriculum_thresholds=args.curriculum_thresholds,
+        curriculum_patience=args.curriculum_patience,
         eval_interval=args.eval_interval,
         eval_episodes=args.eval_episodes,
         save_interval=args.save_interval,

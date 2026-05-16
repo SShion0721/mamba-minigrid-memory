@@ -50,6 +50,7 @@ class RolloutBuffer:
         self.context_actions = np.zeros((num_envs, context_len, action_dim), dtype=self.prev_actions.dtype)
         self.context_rewards = np.zeros((num_envs, context_len, 1), dtype=self.prev_rewards.dtype)
         self.context_starts = np.zeros((num_envs, context_len, 1), dtype=self.episode_starts.dtype)
+        self.context_valid = np.zeros((num_envs, context_len), dtype=np.float32)
 
         self.hist_obs = np.zeros_like(self.context_obs)
         self.hist_dirs = np.zeros_like(self.context_dirs)
@@ -157,8 +158,8 @@ class RolloutBuffer:
         current_prev_actions: np.ndarray | None = None,
         current_prev_rewards: np.ndarray | None = None,
         current_episode_starts: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return right-aligned context windows, optionally including current token."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return left-aligned context windows, optionally including current token."""
 
         ctx_len = self.context_len
         obs_ctx = self.context_obs
@@ -166,18 +167,20 @@ class RolloutBuffer:
         act_ctx = self.context_actions
         rew_ctx = self.context_rewards
         start_ctx = self.context_starts
+        valid_ctx = self.context_valid
         obs_ctx.fill(0)
         dir_ctx.fill(0)
         act_ctx.fill(0)
         rew_ctx.fill(0)
         start_ctx.fill(0)
+        valid_ctx.fill(0)
 
         include_current = current_obs is not None
-        hist_end = ctx_len - int(include_current)
+        hist_capacity = ctx_len - int(include_current)
         for env_idx in range(self.num_envs):
-            hist_take = min(int(self.hist_len[env_idx]), hist_end)
+            hist_take = min(int(self.hist_len[env_idx]), hist_capacity)
             if hist_take:
-                dest = slice(hist_end - hist_take, hist_end)
+                dest = slice(0, hist_take)
                 _copy_ring_tail(self.hist_obs[env_idx], self.hist_pos[env_idx], hist_take, obs_ctx[env_idx, dest])
                 _copy_ring_tail(self.hist_dirs[env_idx], self.hist_pos[env_idx], hist_take, dir_ctx[env_idx, dest])
                 _copy_ring_tail(
@@ -188,15 +191,18 @@ class RolloutBuffer:
                 )
                 _copy_ring_tail(self.hist_rewards[env_idx], self.hist_pos[env_idx], hist_take, rew_ctx[env_idx, dest])
                 _copy_ring_tail(self.hist_starts[env_idx], self.hist_pos[env_idx], hist_take, start_ctx[env_idx, dest])
+                valid_ctx[env_idx, dest] = 1.0
 
         if include_current:
-            obs_ctx[:, -1] = current_obs
-            dir_ctx[:, -1] = current_directions
-            act_ctx[:, -1] = current_prev_actions
-            rew_ctx[:, -1] = current_prev_rewards
-            start_ctx[:, -1] = current_episode_starts
+            insert_at = np.minimum(self.hist_len, hist_capacity)
+            obs_ctx[self.env_indices, insert_at] = current_obs
+            dir_ctx[self.env_indices, insert_at] = current_directions
+            act_ctx[self.env_indices, insert_at] = current_prev_actions
+            rew_ctx[self.env_indices, insert_at] = current_prev_rewards
+            start_ctx[self.env_indices, insert_at] = current_episode_starts
+            valid_ctx[self.env_indices, insert_at] = 1.0
 
-        return obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx
+        return obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx, valid_ctx
 
     def compute_gae(self, next_value, gamma: float = 0.99, gae_lambda: float = 0.95):
         """Compute and store generalized advantage estimates."""
@@ -397,6 +403,7 @@ class PPOTrainer:
                     old_value_seq,
                     valid_mask,
                     loss_mask,
+                    lengths,
                 ) = _pack_sequence_batch(buffer, selected, advantages, chunk_len, burn_in_len)
 
                 with self._autocast():
@@ -407,6 +414,7 @@ class PPOTrainer:
                         torch.as_tensor(prev_rew_seq, device=self.device),
                         torch.as_tensor(ep_start_seq, device=self.device),
                         valid_mask=torch.as_tensor(valid_mask, device=self.device),
+                        lengths=torch.as_tensor(lengths, device=self.device),
                     )
                     dist = _safe_categorical(logits)
                     new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
@@ -587,6 +595,7 @@ def _pack_sequence_batch(
     old_value_seq = np.zeros((batch_size, sequence_len), dtype=buffer.values.dtype)
     valid_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
     loss_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
+    lengths = np.zeros(batch_size, dtype=np.int64)
 
     for batch_idx, (env_idx, segment_start, start, end) in enumerate(selected):
         burn_start = max(segment_start, start - burn_in_len)
@@ -596,7 +605,7 @@ def _pack_sequence_batch(
         target_length = end - start
         if sequence_length <= 0 or target_length <= 0:
             continue
-        offset = sequence_len - sequence_length
+        offset = 0
         dest = slice(offset, offset + sequence_length)
         src = slice(burn_start, sequence_end)
         obs_seq[batch_idx, dest] = buffer.observations[src, env_idx]
@@ -610,6 +619,7 @@ def _pack_sequence_batch(
         ret_seq[batch_idx, dest] = buffer.returns[src, env_idx]
         old_value_seq[batch_idx, dest] = buffer.values[src, env_idx]
         valid_mask[batch_idx, dest] = 1.0
+        lengths[batch_idx] = sequence_length
         loss_start = offset + target_start
         loss_mask[batch_idx, loss_start : loss_start + target_length] = 1.0
 
@@ -626,4 +636,5 @@ def _pack_sequence_batch(
         old_value_seq,
         valid_mask,
         loss_mask,
+        lengths,
     )

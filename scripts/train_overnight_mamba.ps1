@@ -12,6 +12,7 @@ param(
     [int]$NEpochs = 4,
     [int]$DModel = 128,
     [string]$SpatialEncoder = "hybrid",
+    [int]$SlotCount = 4,
     [int]$MambaLayers = 2,
     [int]$DState = 64,
     [int]$MambaHeadDim = 64,
@@ -34,6 +35,7 @@ param(
     [string]$FallbackVariant = "mamba2",
     [switch]$Compile,
     [switch]$NoStatefulRollout,
+    [switch]$AllowLegacyLoad,
     [switch]$NoFallback
 )
 
@@ -44,13 +46,12 @@ Set-Location $RepoRoot
 
 New-Item -ItemType Directory -Force -Path "logs" | Out-Null
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogPath = Join-Path $RepoRoot "logs\$RunName`_$TimeStamp.log"
 
 $env:PYTHONUNBUFFERED = "1"
 $env:CUDA_VISIBLE_DEVICES = $CudaVisibleDevices
-$env:TRITON_CACHE_DIR = Join-Path $RepoRoot ".triton_cache\$RunName"
+$env:TRITON_CACHE_DIR = Join-Path $RepoRoot ".triton_cache\preflight_$RunName"
 New-Item -ItemType Directory -Force -Path $env:TRITON_CACHE_DIR | Out-Null
-Write-Host "Triton cache: $env:TRITON_CACHE_DIR"
+Write-Host "Preflight Triton cache: $env:TRITON_CACHE_DIR"
 
 $RequestedVariant = $MambaVariant
 $PreflightCode = "from mamba_ssm import Mamba, Mamba2, Mamba3; variant='$MambaVariant'; builders={'mamba': lambda: Mamba(d_model=$DModel, d_state=$DState, d_conv=4, expand=2), 'mamba2': lambda: Mamba2(d_model=$DModel, d_state=$DState, d_conv=4, expand=2, headdim=$MambaHeadDim, ngroups=$MambaNGroups, chunk_size=$MambaChunkSize), 'mamba3': lambda: Mamba3(d_model=$DModel, d_state=$DState, expand=2, headdim=$MambaHeadDim, ngroups=$MambaNGroups, chunk_size=$MambaChunkSize)}; builders[variant](); print(f'{variant} preflight ok')"
@@ -72,6 +73,11 @@ if ($LASTEXITCODE -ne 0) {
         throw "Fallback Mamba variant '$MambaVariant' also failed preflight."
     }
 }
+
+$LogPath = Join-Path $RepoRoot "logs\$RunName`_$TimeStamp.log"
+$env:TRITON_CACHE_DIR = Join-Path $RepoRoot ".triton_cache\$RunName"
+New-Item -ItemType Directory -Force -Path $env:TRITON_CACHE_DIR | Out-Null
+Write-Host "Triton cache: $env:TRITON_CACHE_DIR"
 
 if (-not $ResumeFrom) {
     $Latest = Join-Path $RepoRoot "runs\$RunName\model_latest.pt"
@@ -97,6 +103,7 @@ $ArgsList = @(
     "--batch-chunks", "$BatchChunks",
     "--d-model", "$DModel",
     "--spatial-encoder", $SpatialEncoder,
+    "--slot-count", "$SlotCount",
     "--spatial-layers", "2",
     "--spatial-heads", "4",
     "--mamba-layers", "$MambaLayers",
@@ -127,6 +134,9 @@ if ($Compile) {
 }
 if ($NoStatefulRollout) {
     $ArgsList += @("--no-stateful-rollout")
+}
+if ($AllowLegacyLoad) {
+    $ArgsList += @("--allow-legacy-load")
 }
 
 Write-Host "Repo: $RepoRoot"
