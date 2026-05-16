@@ -521,6 +521,8 @@ def train(config: Config) -> None:
             sps = (global_step - initial_global_step) / max(time.time() - start_time, 1e-6)
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
             writer.add_scalar("charts/SPS", sps, global_step)
+            for name, value in _memory_diagnostics(model).items():
+                writer.add_scalar(f"memory/{name}", value, global_step)
 
             mean_train_return = np.mean(recent_returns) if recent_returns else float("nan")
             mean_train_length = np.mean(recent_lengths) if recent_lengths else float("nan")
@@ -1019,6 +1021,27 @@ def _model_parameter_dtype(model) -> torch.dtype:
 
 def _model_state_dict(model):
     return getattr(model, "_orig_mod", model).state_dict()
+
+
+def _memory_diagnostics(model) -> dict[str, float]:
+    base = getattr(model, "_orig_mod", model)
+    values: dict[str, list[float]] = {
+        "gate_mean": [],
+        "retrieval_entropy": [],
+        "write_rate": [],
+    }
+    for module in base.modules():
+        if hasattr(module, "last_gate_mean"):
+            values["gate_mean"].append(float(module.last_gate_mean))
+        if hasattr(module, "last_retrieval_entropy"):
+            values["retrieval_entropy"].append(float(module.last_retrieval_entropy))
+        if hasattr(module, "last_write_rate"):
+            values["write_rate"].append(float(module.last_write_rate))
+    return {
+        key: float(np.mean(items))
+        for key, items in values.items()
+        if items
+    }
 
 
 def _apply_checkpoint_arch_config(config: Config, ckpt) -> None:

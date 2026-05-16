@@ -8,6 +8,7 @@ from src.cue import CUE_IGNORE_INDEX, extract_cue_targets_np
 from src.impala import vtrace_from_importance_weights
 from src.models import EpisodicCueMemory, FastGatedAttentionActorCritic, GRUActorCritic, TokenEncoder
 from src.r2d2 import RecurrentSequenceReplay
+from src.train_mamba_ppo import Config, _memory_diagnostics, _runtime_metadata
 
 
 def test_checkpoint_strict_rejects_unexpected_keys_but_legacy_allows():
@@ -22,6 +23,42 @@ def test_checkpoint_strict_rejects_unexpected_keys_but_legacy_allows():
     missing, unexpected = model.load_state_dict(legacy_state, strict=False)
     assert not missing
     assert unexpected == ["token_encoder.legacy_gate.weight"]
+
+
+def test_slot_memory_checkpoint_metadata_and_strict_roundtrip():
+    config = Config(model="gru", d_model=32, slot_count=2, num_envs=1, num_steps=2)
+    model = GRUActorCritic(
+        action_dim=7,
+        d_model=32,
+        slot_count=2,
+        slot_extractor=config.slot_extractor,
+        slot_iters=config.slot_iters,
+        temporal_token_mode=config.temporal_token_mode,
+        memory_kind=config.memory_kind,
+        memory_slots=4,
+        memory_topk=2,
+        aux_recall=True,
+    )
+    clone = GRUActorCritic(
+        action_dim=7,
+        d_model=32,
+        slot_count=2,
+        slot_extractor=config.slot_extractor,
+        slot_iters=config.slot_iters,
+        temporal_token_mode=config.temporal_token_mode,
+        memory_kind=config.memory_kind,
+        memory_slots=4,
+        memory_topk=2,
+        aux_recall=True,
+    )
+    missing, unexpected = clone.load_state_dict(model.state_dict(), strict=True)
+    assert missing == []
+    assert unexpected == []
+    metadata = _runtime_metadata(config, action_dim=7)
+    assert metadata["config"]["slot_extractor"] == "iterative"
+    assert metadata["config"]["temporal_token_mode"] == "fuse"
+    assert metadata["config"]["memory_kind"] == "episodic_cue"
+    assert metadata["config"]["aux_recall_coef"] == 0.05
 
 
 def test_vtrace_matches_td_when_on_policy_and_unclipped():
@@ -97,6 +134,26 @@ def test_iterative_slots_and_fused_tokens_forward_smoke():
     assert torch.isfinite(tokens).all()
 
 
+def test_memory_diagnostics_expose_gate_entropy_and_write_rate():
+    obs, direction, prev_action, prev_reward, episode_start, valid_mask = _sequence_inputs(batch=1, seq_len=3)
+    model = GRUActorCritic(
+        action_dim=7,
+        d_model=32,
+        slot_count=2,
+        slot_extractor="iterative",
+        temporal_token_mode="fuse",
+        memory_kind="episodic_cue",
+        aux_recall=True,
+    )
+    with torch.no_grad():
+        model(obs, direction, prev_action, prev_reward, episode_start, valid_mask=valid_mask, return_aux=True)
+    diagnostics = _memory_diagnostics(model)
+    assert set(diagnostics) == {"gate_mean", "retrieval_entropy", "write_rate"}
+    assert 0.0 <= diagnostics["gate_mean"] <= 1.0
+    assert diagnostics["retrieval_entropy"] >= 0.0
+    assert diagnostics["write_rate"] > 0.0
+
+
 def test_flatten_and_fuse_modes_preserve_policy_shapes():
     obs, direction, prev_action, prev_reward, episode_start, valid_mask = _sequence_inputs(batch=1, seq_len=4)
     for mode, expected_tokens in [("flatten", 3), ("fuse", 1)]:
@@ -121,20 +178,22 @@ def test_episode_cue_memory_resets_on_episode_start():
     memory = EpisodicCueMemory(d_model=16, memory_slots=4, topk=2)
     state = memory.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
     token = torch.randn(1, 16)
-    _, state, _, _ = memory.forward_step(
+    _, state, _, _, write_rate = memory.forward_step(
         token,
         torch.tensor([5 * 16 + 2]),
         torch.ones(1, 1),
         state,
     )
     assert state["valid"].any()
-    _, state, _, _ = memory.forward_step(
+    assert write_rate.item() == 1.0
+    _, state, _, _, write_rate = memory.forward_step(
         token,
         torch.tensor([CUE_IGNORE_INDEX]),
         torch.ones(1, 1),
         state,
     )
     assert not state["valid"].any()
+    assert write_rate.item() == 0.0
 
 
 def test_cue_target_extraction_uses_only_visible_non_background_objects():

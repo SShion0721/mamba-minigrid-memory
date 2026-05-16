@@ -301,6 +301,7 @@ class EpisodicCueMemory(nn.Module):
         nn.init.normal_(self.value_emb.weight, std=0.02)
         self.last_gate_mean = 0.0
         self.last_retrieval_entropy = 0.0
+        self.last_write_rate = 0.0
 
     def init_state(
         self,
@@ -350,9 +351,10 @@ class EpisodicCueMemory(nn.Module):
         outputs = []
         gate_stats = []
         entropy_stats = []
+        write_stats = []
         for idx in range(seq_len):
             valid = None if valid_mask is None else valid_mask[:, idx].to(device=step_tokens.device).bool()
-            out, state, gate_mean, entropy = self.forward_step(
+            out, state, gate_mean, entropy, write_rate = self.forward_step(
                 step_tokens[:, idx],
                 cue_targets[:, idx],
                 episode_start_seq[:, idx],
@@ -362,9 +364,11 @@ class EpisodicCueMemory(nn.Module):
             outputs.append(out)
             gate_stats.append(gate_mean)
             entropy_stats.append(entropy)
+            write_stats.append(write_rate)
         if gate_stats and not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
             self.last_gate_mean = float(torch.stack(gate_stats).mean().detach().cpu())
             self.last_retrieval_entropy = float(torch.stack(entropy_stats).mean().detach().cpu())
+            self.last_write_rate = float(torch.stack(write_stats).mean().detach().cpu())
         return torch.stack(outputs, dim=1)
 
     def forward_step(
@@ -374,7 +378,7 @@ class EpisodicCueMemory(nn.Module):
         episode_start: torch.Tensor,
         state: dict[str, torch.Tensor] | None,
         valid: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         if state is None:
             state = self.init_state(
                 step_token.shape[0],
@@ -396,11 +400,16 @@ class EpisodicCueMemory(nn.Module):
         has_new_cue = (state["episode_cue"] == CUE_IGNORE_INDEX) & (current_target != CUE_IGNORE_INDEX)
         in_write_window = state["age"] < self.write_window
         write_mask = valid & has_new_cue & in_write_window
+        write_rate = write_mask.float().mean()
         if write_mask.any():
             state["episode_cue"] = torch.where(write_mask, current_target, state["episode_cue"])
             self._write(state, step_token, current_target, write_mask)
         state["age"] = torch.where(valid, state["age"] + 1, state["age"])
-        return enhanced, state, gate.mean(), entropy
+        if not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
+            self.last_gate_mean = float(gate.mean().detach().cpu())
+            self.last_retrieval_entropy = float(entropy.detach().cpu())
+            self.last_write_rate = float(write_rate.detach().cpu())
+        return enhanced, state, gate.mean(), entropy, write_rate
 
     def _read(self, query: torch.Tensor, state: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         keys = state["keys"]
@@ -597,7 +606,7 @@ class TokenEncoder(nn.Module):
             x = self.token_norm(x).squeeze(1)
             if self.memory is not None:
                 cue_target = extract_cue_targets_torch(obs)
-                x, memory_state, _, _ = self.memory.forward_step(x, cue_target, episode_start, memory_state)
+                x, memory_state, _, _, _ = self.memory.forward_step(x, cue_target, episode_start, memory_state)
             return x.unsqueeze(1), memory_state
 
         slot_tokens = slots + side.unsqueeze(-2)
@@ -605,7 +614,7 @@ class TokenEncoder(nn.Module):
         x = self.token_norm(x).squeeze(1)
         if self.memory is not None:
             cue_target = extract_cue_targets_torch(obs)
-            enhanced_global, memory_state, _, _ = self.memory.forward_step(
+            enhanced_global, memory_state, _, _, _ = self.memory.forward_step(
                 x[:, self.slot_count],
                 cue_target,
                 episode_start,
