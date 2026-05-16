@@ -438,18 +438,3 @@ scripts/train_overnight_mamba.ps1   Windows overnight 训练脚本
 tests/                              单元测试和 smoke 测试
 ```
 
-## 判断是否继续加新机制
-
-先不要急着加 DNC、RAG、Neural Map、IMPALA 或 R2D2。只有当下面这个结构明显优于旧 baseline，再继续扩展：
-
-```text
-iterative + fuse + episodic_cue_memory + aux_recall
-```
-
-最低比较对象：
-
-```text
-query_pool + flatten + no_memory
-```
-
-如果新结构在 S13Random 多 seed 上没有明显优势，优先检查 cue target、memory gate、retrieval entropy 和 aux recall，而不是继续堆更大的记忆系统。
