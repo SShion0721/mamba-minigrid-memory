@@ -10,6 +10,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import os
 import sys
 import time
@@ -50,6 +51,8 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
+    clip_vloss: bool = True
+    norm_adv: bool = True
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -78,9 +81,17 @@ class Config:
     d_state: int = 16
     d_conv: int = 4
     expand: int = 2
+    mamba_headdim: int = 64
+    mamba_ngroups: int = 1
+    mamba_chunk_size: int = 64
+    mamba_rope_fraction: float = 0.5
     attention_layers: int = 2
     attention_heads: int = 4
+    gated_attention_pos: str = "learned"
     valid_actions: str = "0,1,2"
+    stateful_rollout: bool = True
+    torch_compile: bool = False
+    amp: str = "none"
 
     eval_interval: int = 20_000
     eval_episodes: int = 30
@@ -101,6 +112,7 @@ def train(config: Config) -> None:
     print(f"Using device: {device}")
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
+    amp_dtype = _amp_dtype(config.amp, device)
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -118,6 +130,7 @@ def train(config: Config) -> None:
         ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)
         global_step = int(ckpt.get("global_step", 0))
         print(f"Resumed checkpoint {config.resume_from} at global_step={global_step}")
+        _apply_checkpoint_arch_config(config, ckpt)
 
     envs = [
         make_env(
@@ -135,20 +148,36 @@ def train(config: Config) -> None:
 
     model = build_actor_critic(config, action_dim=action_dim).to(device)
     if config.resume_from:
-        # ckpt already loaded above for global_step
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"Checkpoint loaded with missing={missing} unexpected={unexpected}")
+
+    if config.torch_compile:
+        if hasattr(torch, "compile"):
+            model.forward = torch.compile(model.forward)
+            print("torch.compile enabled for model.forward")
+        else:
+            print("Warning: --compile requested, but this PyTorch build has no torch.compile.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
+    optimizer_loaded = False
     if config.resume_from and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        optimizer_loaded = _try_load_optimizer_state(optimizer, ckpt["optimizer_state_dict"])
 
     remaining_steps = max(config.total_steps - global_step, config.num_envs * config.num_steps)
     num_updates = max(1, remaining_steps // (config.num_envs * config.num_steps))
-    scheduler = lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_updates,
-        eta_min=1e-6,
-    )
+    scheduler = None
+    if config.anneal_lr:
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=num_updates,
+            eta_min=1e-6,
+        )
+        if config.resume_from and "scheduler_state_dict" in ckpt:
+            if optimizer_loaded:
+                _try_load_scheduler_state(scheduler, ckpt["scheduler_state_dict"])
+            else:
+                print("Scheduler state skipped because optimizer state was rebuilt.")
 
     trainer = PPOTrainer(
         model=model,
@@ -160,9 +189,12 @@ def train(config: Config) -> None:
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,
         target_kl=config.target_kl,
+        clip_vloss=config.clip_vloss,
+        norm_adv=config.norm_adv,
+        amp_dtype=amp_dtype,
     )
 
-    obs_buf = np.zeros((config.num_envs, *obs_shape), dtype=np.float32)
+    obs_buf = np.zeros((config.num_envs, *obs_shape), dtype=np.uint8)
     direction_buf = np.zeros((config.num_envs, 1), dtype=np.int64)
     prev_action_buf = np.zeros((config.num_envs, action_dim), dtype=np.float32)
     prev_reward_buf = np.zeros((config.num_envs, 1), dtype=np.float32)
@@ -202,6 +234,25 @@ def train(config: Config) -> None:
     initial_global_step = global_step
     next_eval = _next_interval_boundary(global_step, config.eval_interval)
     next_save = _next_interval_boundary(global_step, config.save_interval)
+    use_stateful_rollout = (
+        config.stateful_rollout
+        and config.model in {"mamba", "gated_attention"}
+        and (config.model != "gated_attention" or config.gated_attention_pos in {"none", "alibi"})
+        and hasattr(model, "init_inference_state")
+        and hasattr(model, "get_action_and_value_step")
+    )
+    mamba_inference_state = None
+    if use_stateful_rollout:
+        try:
+            mamba_inference_state = model.init_inference_state(
+                config.num_envs,
+                device=device,
+                dtype=amp_dtype or _model_parameter_dtype(model),
+            )
+            print(f"Stateful {config.model} rollout enabled.")
+        except Exception as exc:
+            use_stateful_rollout = False
+            print(f"Stateful {config.model} rollout disabled during cache init: {type(exc).__name__}: {exc}")
 
     print(
         "Training config: "
@@ -209,7 +260,9 @@ def train(config: Config) -> None:
         f"steps={global_step}->{config.total_steps} num_envs={config.num_envs} "
         f"rollout={config.num_steps} context={config.context_len} "
         f"chunk={config.chunk_len} batch_chunks={config.batch_chunks} "
-        f"spatial={config.spatial_encoder} valid_actions={config.valid_actions}",
+        f"spatial={config.spatial_encoder} valid_actions={config.valid_actions} "
+        f"gated_pos={config.gated_attention_pos} "
+        f"amp={config.amp} compile={config.torch_compile} stateful={use_stateful_rollout}",
         flush=True,
     )
 
@@ -226,7 +279,7 @@ def train(config: Config) -> None:
         ascii=True,
     ) as pbar:
         for update in range(num_updates):
-            progress = update / max(num_updates, 1)
+            progress = min(global_step / max(config.total_steps, 1), 1.0)
             trainer.ent_coef = config.ent_coef + progress * (config.ent_coef_final - config.ent_coef)
 
             model.train()
@@ -242,7 +295,40 @@ def train(config: Config) -> None:
                         recent_successes=recent_successes,
                     )
                 )
-                if config.model in SEQUENCE_MODELS:
+                if use_stateful_rollout and mamba_inference_state is not None:
+                    try:
+                        with torch.no_grad(), _autocast_context(device, amp_dtype):
+                            action, logprob, _, value, mamba_inference_state = model.get_action_and_value_step(
+                                torch.as_tensor(obs_buf, device=device),
+                                torch.as_tensor(direction_buf, device=device),
+                                torch.as_tensor(prev_action_buf, device=device),
+                                torch.as_tensor(prev_reward_buf, device=device),
+                                torch.as_tensor(episode_start_buf, device=device),
+                                mamba_inference_state,
+                            )
+                    except (AssertionError, NotImplementedError, RuntimeError) as exc:
+                        use_stateful_rollout = False
+                        mamba_inference_state = None
+                        tqdm.write(
+                            f"Stateful {config.model} rollout disabled; falling back to full-context rollout "
+                            f"after {type(exc).__name__}: {exc}"
+                        )
+                        context = buffer.get_context(
+                            obs_buf,
+                            direction_buf,
+                            prev_action_buf,
+                            prev_reward_buf,
+                            episode_start_buf,
+                        )
+                        with torch.no_grad(), _autocast_context(device, amp_dtype):
+                            action, logprob, _, value = model.get_action_and_value(
+                                torch.as_tensor(context[0], device=device),
+                                torch.as_tensor(context[1], device=device),
+                                torch.as_tensor(context[2], device=device),
+                                torch.as_tensor(context[3], device=device),
+                                torch.as_tensor(context[4], device=device),
+                            )
+                elif config.model in SEQUENCE_MODELS:
                     context = buffer.get_context(
                         obs_buf,
                         direction_buf,
@@ -250,7 +336,7 @@ def train(config: Config) -> None:
                         prev_reward_buf,
                         episode_start_buf,
                     )
-                    with torch.no_grad():
+                    with torch.no_grad(), _autocast_context(device, amp_dtype):
                         action, logprob, _, value = model.get_action_and_value(
                             torch.as_tensor(context[0], device=device),
                             torch.as_tensor(context[1], device=device),
@@ -259,7 +345,7 @@ def train(config: Config) -> None:
                             torch.as_tensor(context[4], device=device),
                         )
                 else:
-                    with torch.no_grad():
+                    with torch.no_grad(), _autocast_context(device, amp_dtype):
                         action, logprob, _, value = model.get_action_and_value(
                             torch.as_tensor(obs_buf, device=device),
                             torch.as_tensor(direction_buf, device=device),
@@ -268,33 +354,22 @@ def train(config: Config) -> None:
                             torch.as_tensor(episode_start_buf, device=device),
                         )
 
-                action_np = action.cpu().numpy()
-                logprob_np = logprob.cpu().numpy()
-                value_np = value.cpu().numpy()
+                action_np = action.cpu().numpy().astype(np.int64, copy=False)
+                logprob_np = logprob.float().cpu().numpy()
+                value_np = value.float().cpu().numpy()
+                rollout_obs = obs_buf.copy()
+                rollout_directions = direction_buf.copy()
+                rollout_prev_actions = prev_action_buf.copy()
+                rollout_prev_rewards = prev_reward_buf.copy()
+                rollout_episode_starts = episode_start_buf.copy()
+                rewards_np = np.zeros(config.num_envs, dtype=np.float32)
+                done_mask_np = np.zeros(config.num_envs, dtype=bool)
 
                 for env_idx, env in enumerate(envs):
-                    current_obs = obs_buf[env_idx].copy()
-                    current_direction = direction_buf[env_idx].copy()
-                    current_prev_action = prev_action_buf[env_idx].copy()
-                    current_prev_reward = prev_reward_buf[env_idx].copy()
-                    current_episode_start = episode_start_buf[env_idx].copy()
-
-                    obs_dict, reward, terminated, truncated, _ = env.step(action_np[env_idx])
+                    obs_dict, reward, terminated, truncated, _ = env.step(int(action_np[env_idx]))
                     done = terminated or truncated
-
-                    buffer.add(
-                        env_idx=env_idx,
-                        obs=current_obs,
-                        direction=current_direction,
-                        action=int(action_np[env_idx]),
-                        logprob=float(logprob_np[env_idx]),
-                        value=float(value_np[env_idx]),
-                        reward=float(reward),
-                        done=done,
-                        prev_action=current_prev_action,
-                        prev_reward=current_prev_reward,
-                        episode_start=current_episode_start,
-                    )
+                    rewards_np[env_idx] = float(reward)
+                    done_mask_np[env_idx] = done
 
                     episode_returns[env_idx] += reward
                     episode_lengths[env_idx] += 1
@@ -315,6 +390,25 @@ def train(config: Config) -> None:
                     prev_action_buf[env_idx] = obs_dict["prev_action"]
                     prev_reward_buf[env_idx] = obs_dict["prev_reward"]
                     episode_start_buf[env_idx] = obs_dict["episode_start"]
+
+                buffer.add_batch(
+                    obs=rollout_obs,
+                    directions=rollout_directions,
+                    actions=action_np,
+                    logprobs=logprob_np,
+                    values=value_np,
+                    rewards=rewards_np,
+                    dones=done_mask_np,
+                    prev_actions=rollout_prev_actions,
+                    prev_rewards=rollout_prev_rewards,
+                    episode_starts=rollout_episode_starts,
+                )
+
+                if use_stateful_rollout and mamba_inference_state is not None and done_mask_np.any():
+                    model.reset_inference_state(
+                        mamba_inference_state,
+                        torch.as_tensor(done_mask_np, device=device, dtype=torch.bool),
+                    )
 
                 buffer.step += 1
                 global_step += config.num_envs
@@ -385,7 +479,8 @@ def train(config: Config) -> None:
                 )
 
             buffer.reset_rollout()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
             sps = (global_step - initial_global_step) / max(time.time() - start_time, 1e-6)
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
@@ -472,16 +567,16 @@ def train(config: Config) -> None:
                     )
                 )
                 ckpt_path = os.path.join(run_dir, f"model_{global_step}.pt")
-                _save_checkpoint(ckpt_path, model, optimizer, config, global_step, action_dim)
+                _save_checkpoint(ckpt_path, model, optimizer, scheduler, config, global_step, action_dim)
                 latest_path = os.path.join(run_dir, "model_latest.pt")
-                _save_checkpoint(latest_path, model, optimizer, config, global_step, action_dim)
+                _save_checkpoint(latest_path, model, optimizer, scheduler, config, global_step, action_dim)
                 tqdm.write(f"Saved checkpoint: {ckpt_path}")
                 next_save += config.save_interval
 
     final_path = os.path.join(run_dir, "model_final.pt")
-    _save_checkpoint(final_path, model, optimizer, config, global_step, action_dim)
+    _save_checkpoint(final_path, model, optimizer, scheduler, config, global_step, action_dim)
     latest_path = os.path.join(run_dir, "model_latest.pt")
-    _save_checkpoint(latest_path, model, optimizer, config, global_step, action_dim)
+    _save_checkpoint(latest_path, model, optimizer, scheduler, config, global_step, action_dim)
     print(f"Training complete. Final model saved to {final_path}")
 
     for env in envs:
@@ -510,6 +605,7 @@ def evaluate(
             spinning_threshold=config.spinning_threshold,
         )
         obs_dict, _ = env.reset(seed=config.seed + 10_000 + episode)
+        action_dim = env.action_space.n
         obs = obs_dict["obs"]
         direction = obs_dict["direction"]
         prev_action = obs_dict["prev_action"]
@@ -543,6 +639,7 @@ def evaluate(
                     rew_ctx,
                     start_ctx,
                     config.context_len,
+                    action_dim,
                     greedy=True,
                 )
             else:
@@ -604,7 +701,7 @@ def _bootstrap_value(
                 torch.as_tensor(context[3], device=device),
                 torch.as_tensor(context[4], device=device),
             )
-            return values[:, -1].cpu().numpy()
+            return values[:, -1].float().cpu().numpy()
 
         _, next_value = model.forward(
             torch.as_tensor(obs_buf, device=device),
@@ -613,7 +710,7 @@ def _bootstrap_value(
             torch.as_tensor(prev_reward_buf, device=device),
             torch.as_tensor(episode_start_buf, device=device),
         )
-        return next_value.cpu().numpy()
+        return next_value.float().cpu().numpy()
 
 
 def _select_sequence_action(
@@ -625,11 +722,12 @@ def _select_sequence_action(
     rew_ctx: deque,
     start_ctx: deque,
     context_len: int,
+    action_dim: int,
     *,
     greedy: bool,
 ) -> int:
     obs_seq, dir_seq, act_seq, rew_seq, start_seq = _pack_context(
-        obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx, context_len
+        obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx, context_len, action_dim
     )
     with torch.no_grad():
         logits, _ = model.forward(
@@ -652,16 +750,18 @@ def _pack_context(
     rew_ctx: deque,
     start_ctx: deque,
     context_len: int,
+    action_dim: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(obs_ctx)
-    obs_seq = np.zeros((1, context_len, 7, 7, 3), dtype=np.float32)
+    obs_shape = np.asarray(obs_ctx[0]).shape if n else (7, 7, 3)
+    obs_seq = np.zeros((1, context_len, *obs_shape), dtype=np.uint8)
     dir_seq = np.zeros((1, context_len, 1), dtype=np.int64)
-    act_seq = np.zeros((1, context_len, 7), dtype=np.float32)
+    act_seq = np.zeros((1, context_len, action_dim), dtype=np.float32)
     rew_seq = np.zeros((1, context_len, 1), dtype=np.float32)
     start_seq = np.zeros((1, context_len, 1), dtype=np.float32)
 
     if n:
-        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.float32)
+        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.uint8)
         dir_seq[0, -n:] = np.asarray(list(dir_ctx), dtype=np.int64)
         act_seq[0, -n:] = np.asarray(list(act_ctx), dtype=np.float32)
         rew_seq[0, -n:] = np.asarray(list(rew_ctx), dtype=np.float32)
@@ -670,18 +770,26 @@ def _pack_context(
     return obs_seq, dir_seq, act_seq, rew_seq, start_seq
 
 
-def _save_checkpoint(path: str, model, optimizer, config: Config, global_step: int, action_dim: int) -> None:
+def _save_checkpoint(
+    path: str,
+    model,
+    optimizer,
+    scheduler,
+    config: Config,
+    global_step: int,
+    action_dim: int,
+) -> None:
     config_dict = asdict(config)
     config_dict["action_dim"] = action_dim
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config_dict": config_dict,
-            "global_step": global_step,
-        },
-        path,
-    )
+    state = {
+        "model_state_dict": _model_state_dict(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config_dict": config_dict,
+        "global_step": global_step,
+    }
+    if scheduler is not None:
+        state["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(state, path)
 
 
 def _default_run_name(config: Config) -> str:
@@ -700,6 +808,111 @@ def _next_interval_boundary(current_step: int, interval: int) -> int:
     if interval <= 0:
         return sys.maxsize
     return ((current_step // interval) + 1) * interval
+
+
+def _amp_dtype(value: str, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda" or value == "none":
+        return None
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp16":
+        return torch.float16
+    raise ValueError(f"Unknown AMP mode: {value}")
+
+
+def _autocast_context(device: torch.device, dtype: torch.dtype | None):
+    if dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def _model_parameter_dtype(model) -> torch.dtype:
+    return next(model.parameters()).dtype
+
+
+def _model_state_dict(model):
+    return getattr(model, "_orig_mod", model).state_dict()
+
+
+def _apply_checkpoint_arch_config(config: Config, ckpt) -> None:
+    saved = ckpt.get("config_dict", {})
+    if not isinstance(saved, dict):
+        return
+
+    arch_keys = (
+        "env_id",
+        "model",
+        "spatial_encoder",
+        "spatial_layers",
+        "spatial_heads",
+        "mamba_variant",
+        "mamba_layers",
+        "d_model",
+        "d_state",
+        "d_conv",
+        "expand",
+        "mamba_headdim",
+        "mamba_ngroups",
+        "mamba_chunk_size",
+        "mamba_rope_fraction",
+        "attention_layers",
+        "attention_heads",
+        "gated_attention_pos",
+        "valid_actions",
+    )
+    changed = []
+    for key in arch_keys:
+        if key not in saved or not hasattr(config, key):
+            continue
+        old_value = getattr(config, key)
+        new_value = saved[key]
+        if old_value != new_value:
+            setattr(config, key, new_value)
+            changed.append(f"{key}={new_value}")
+    if changed:
+        print("Resume architecture config restored from checkpoint: " + ", ".join(changed))
+
+
+def _try_load_optimizer_state(optimizer, state_dict) -> bool:
+    try:
+        optimizer.load_state_dict(state_dict)
+        print("Optimizer state loaded.")
+        return True
+    except (KeyError, RuntimeError, ValueError) as exc:
+        restored_lr = _restore_optimizer_lr(optimizer, state_dict)
+        if restored_lr is None:
+            lr_note = "using config learning rate"
+        else:
+            lr_note = f"preserved checkpoint lr={restored_lr:.3e}"
+        print(
+            "Warning: optimizer state is incompatible with the current model; "
+            f"continuing with fresh optimizer moments ({lr_note}). "
+            f"Reason: {type(exc).__name__}: {exc}"
+        )
+        return False
+
+
+def _restore_optimizer_lr(optimizer, state_dict) -> float | None:
+    param_groups = state_dict.get("param_groups", []) if isinstance(state_dict, dict) else []
+    restored_lr = None
+    for group, saved_group in zip(optimizer.param_groups, param_groups):
+        if "lr" in saved_group:
+            group["lr"] = saved_group["lr"]
+            restored_lr = float(saved_group["lr"])
+    return restored_lr
+
+
+def _try_load_scheduler_state(scheduler, state_dict) -> bool:
+    try:
+        scheduler.load_state_dict(state_dict)
+        print("Scheduler state loaded.")
+        return True
+    except (KeyError, RuntimeError, ValueError) as exc:
+        print(
+            "Warning: scheduler state is incompatible with the current run; "
+            f"using a fresh scheduler. Reason: {type(exc).__name__}: {exc}"
+        )
+        return False
 
 
 def _progress_status(
@@ -734,6 +947,10 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
+    parser.add_argument("--no-clip-vloss", dest="clip_vloss", action="store_false")
+    parser.set_defaults(clip_vloss=True)
+    parser.add_argument("--no-norm-adv", dest="norm_adv", action="store_false")
+    parser.set_defaults(norm_adv=True)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--ent-coef-final", type=float, default=0.001)
     parser.add_argument("--vf-coef", type=float, default=0.5)
@@ -759,8 +976,13 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--d-state", type=int, default=16)
     parser.add_argument("--d-conv", type=int, default=4)
     parser.add_argument("--expand", type=int, default=2)
+    parser.add_argument("--mamba-headdim", type=int, default=64)
+    parser.add_argument("--mamba-ngroups", type=int, default=1)
+    parser.add_argument("--mamba-chunk-size", type=int, default=64)
+    parser.add_argument("--mamba-rope-fraction", type=float, default=0.5)
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--gated-attention-pos", type=str, default="learned", choices=["learned", "none", "alibi"])
     parser.add_argument(
         "--valid-actions",
         type=str,
@@ -771,6 +993,11 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--eval-episodes", type=int, default=30)
     parser.add_argument("--save-interval", type=int, default=100_000)
     parser.add_argument("--log-interval", type=int, default=10, help="Print training progress every N PPO updates")
+    parser.add_argument("--no-stateful-rollout", dest="stateful_rollout", action="store_false")
+    parser.set_defaults(stateful_rollout=True)
+    parser.add_argument("--compile", dest="torch_compile", action="store_true", help="Compile model.forward with torch.compile")
+    parser.set_defaults(torch_compile=False)
+    parser.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
     parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
     parser.set_defaults(progress_bar=True)
     parser.add_argument("--run-name", type=str, default="")
@@ -787,6 +1014,8 @@ def parse_args(default_model: str = "mamba") -> Config:
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_coef=args.clip_coef,
+        clip_vloss=args.clip_vloss,
+        norm_adv=args.norm_adv,
         ent_coef=args.ent_coef,
         ent_coef_final=args.ent_coef_final,
         vf_coef=args.vf_coef,
@@ -812,9 +1041,17 @@ def parse_args(default_model: str = "mamba") -> Config:
         d_state=args.d_state,
         d_conv=args.d_conv,
         expand=args.expand,
+        mamba_headdim=args.mamba_headdim,
+        mamba_ngroups=args.mamba_ngroups,
+        mamba_chunk_size=args.mamba_chunk_size,
+        mamba_rope_fraction=args.mamba_rope_fraction,
         attention_layers=args.attention_layers,
         attention_heads=args.attention_heads,
+        gated_attention_pos=args.gated_attention_pos,
         valid_actions=args.valid_actions,
+        stateful_rollout=args.stateful_rollout,
+        torch_compile=args.torch_compile,
+        amp=args.amp,
         eval_interval=args.eval_interval,
         eval_episodes=args.eval_episodes,
         save_interval=args.save_interval,

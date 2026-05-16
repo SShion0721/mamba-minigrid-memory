@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import math
 
 import torch
 import torch.nn as nn
@@ -223,12 +224,6 @@ class TokenEncoder(nn.Module):
         self.reward_proj = layer_init(nn.Linear(1, d_model))
         self.start_proj = layer_init(nn.Linear(1, d_model))
         self.token_norm = nn.LayerNorm(d_model)
-        #  episode_start 门控
-        self.start_gate = nn.Sequential(
-            nn.Linear(1, d_model),
-            nn.Sigmoid(),
-        )
-        # 设计思路：当 episode_start=1 时，gate 接近 1，token 主要由 start_proj 提供，重置记忆；当 episode_start=0 时，gate 接近 0，token 主要由 obs_encoder 和 action/reward 投影提供，正常记忆更新。
 
     def forward(
         self,
@@ -238,21 +233,13 @@ class TokenEncoder(nn.Module):
         prev_reward_seq: torch.Tensor,
         episode_start_seq: torch.Tensor,
     ) -> torch.Tensor:
-        x = self.obs_encoder(obs_seq, direction_seq)
-        
-        x = x + self.action_proj(prev_action_seq.float())
-        x = x + self.reward_proj(prev_reward_seq.float())
-        # 使用门控而非简单相加
-        gate = self.start_gate(episode_start_seq.float())
-        x = x * (1 - gate) + self.start_proj(episode_start_seq.float()) * gate
+        x = (
+            self.obs_encoder(obs_seq, direction_seq)
+            + self.action_proj(prev_action_seq.float())
+            + self.reward_proj(prev_reward_seq.float())
+            + self.start_proj(episode_start_seq.float())
+        )
         return self.token_norm(x)
-        # x = (
-        #     x
-        #     + self.action_proj(prev_action_seq.float())
-        #     + self.reward_proj(prev_reward_seq.float())
-        #     + self.start_proj(episode_start_seq.float())
-        # )
-        # return self.token_norm(x)
 
 
 class GRUGate(nn.Module):
@@ -285,6 +272,8 @@ class GatedAttentionBlock(nn.Module):
     """结合 FlashAttention 和 GRU 门控的 Block"""
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}.")
         self.norm1 = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -298,19 +287,30 @@ class GatedAttentionBlock(nn.Module):
         )
         self.gate2 = GRUGate(d_model)
         self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
 
-    def forward(self, x: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        is_causal: bool = True,
+        alibi_slopes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # 1. 快速注意力计算
         B, T, C = x.shape
         qkv = self.qkv(self.norm1(x))
         q, k, v = qkv.chunk(3, dim=-1)
         
-        q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         
         # 调用 PyTorch 原生的高效 SDPA (底层自动使用 FlashAttention)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        attn_mask = None
+        if alibi_slopes is not None:
+            attn_mask = _alibi_attention_mask(T, alibi_slopes, q.device, q.dtype, causal=is_causal)
+            is_causal = False
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
         attn_out = self.out_proj(attn_out)
         
@@ -322,6 +322,53 @@ class GatedAttentionBlock(nn.Module):
         x = self.gate2(x, mlp_out)
         
         return x
+
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        alibi_slopes: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, T, C = x.shape
+        if T != 1:
+            raise ValueError("GatedAttentionBlock.forward_step expects a single token.")
+
+        cache_k, cache_v, lengths = cache
+        qkv = self.qkv(self.norm1(x))
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, 1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, 1, self.n_heads, self.head_dim).transpose(1, 2).squeeze(2)
+        v = v.view(B, 1, self.n_heads, self.head_dim).transpose(1, 2).squeeze(2)
+
+        max_len = cache_k.shape[2]
+        full = lengths >= max_len
+        if bool(full.any()):
+            cache_k[full, :, :-1] = cache_k[full, :, 1:].clone()
+            cache_v[full, :, :-1] = cache_v[full, :, 1:].clone()
+
+        rows = torch.arange(B, device=x.device)
+        write_pos = torch.minimum(lengths, torch.full_like(lengths, max_len - 1))
+        cache_k[rows, :, write_pos] = k
+        cache_v[rows, :, write_pos] = v
+        lengths = torch.clamp(lengths + 1, max=max_len)
+
+        scores = torch.matmul(q, cache_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        positions = torch.arange(max_len, device=x.device)
+        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        scores = scores.masked_fill(~valid[:, None, None, :], torch.finfo(scores.dtype).min)
+        if alibi_slopes is not None:
+            age = (lengths[:, None] - 1 - positions[None, :]).clamp_min(0)
+            scores = scores - alibi_slopes.to(dtype=scores.dtype)[None, :, None, None] * age[:, None, None, :]
+
+        attn = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        attn_out = torch.matmul(attn, cache_v).transpose(1, 2).contiguous().view(B, 1, C)
+        attn_out = self.out_proj(attn_out)
+
+        x = self.gate1(x, attn_out)
+        mlp_out = self.mlp(self.norm2(x))
+        x = self.gate2(x, mlp_out)
+        return x, (cache_k, cache_v, lengths)
     
 
 class MLPActorCritic(nn.Module):
@@ -469,6 +516,10 @@ class MambaActorCritic(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         variant: str = "mamba",
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 64,
+        rope_fraction: float = 0.5,
         spatial_layers: int = 2,
         spatial_heads: int = 4,
         dropout: float = 0.0,
@@ -485,6 +536,8 @@ class MambaActorCritic(nn.Module):
             ) from MAMBA_IMPORT_ERROR
 
         self.action_dim = action_dim
+        self.variant = variant
+        self.residual_scale = 1.0 / max(n_layers, 1) ** 0.5
         _register_action_mask(self, action_dim, valid_actions)
         self.token_encoder = TokenEncoder(
             action_dim=action_dim,
@@ -496,13 +549,21 @@ class MambaActorCritic(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                block_cls(
+                _build_mamba_block(
+                    variant=variant,
+                    block_cls=block_cls,
                     d_model=d_model,
                     d_state=d_state,
                     d_conv=d_conv,
                     expand=expand,
+                    headdim=headdim,
+                    ngroups=ngroups,
+                    chunk_size=chunk_size,
+                    rope_fraction=rope_fraction,
+                    dropout=dropout,
+                    layer_idx=layer_idx,
                 )
-                for _ in range(n_layers)
+                for layer_idx in range(n_layers)
             ]
         )
         self.block_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
@@ -522,16 +583,74 @@ class MambaActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.token_encoder(obs_seq, direction_seq, prev_action_seq, prev_reward_seq, episode_start_seq)
         for norm, block in zip(self.block_norms, self.blocks):
-            h = norm(x)  # 归一化输入，减少数值溢出
-            out = block(h)
-            out = torch.clamp(out, min=-10.0, max=10.0)  # 保留梯度
-            x = x + out
+            out = block(norm(x))
+            _raise_if_nonfinite(out, "Mamba block output")
+            x = x + self.residual_scale * out
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
-        # for block in self.blocks:
-        #     x = x + torch.nan_to_num(block(x), nan=0.0)
-        # x = self.norm(x)
-        # return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+
+    def init_inference_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> list[tuple[torch.Tensor, ...]]:
+        """Allocate Mamba recurrent caches for one-token rollout inference."""
+
+        states: list[tuple[torch.Tensor, ...]] = []
+        for block in self.blocks:
+            if not hasattr(block, "allocate_inference_cache"):
+                raise RuntimeError(f"{type(block).__name__} does not support inference caching.")
+            cache = block.allocate_inference_cache(batch_size, 1, dtype=dtype)
+            cache = tuple(t.to(device=device) if device is not None else t for t in cache)
+            states.append(cache)
+        return states
+
+    @staticmethod
+    def reset_inference_state(
+        inference_state: list[tuple[torch.Tensor, ...]] | None,
+        done_mask: torch.Tensor,
+    ) -> None:
+        if inference_state is None or done_mask.numel() == 0 or not done_mask.any():
+            return
+        for cache in inference_state:
+            for tensor in cache:
+                tensor[done_mask] = 0
+
+    def get_action_and_value_step(
+        self,
+        obs: torch.Tensor,
+        direction: torch.Tensor,
+        prev_action: torch.Tensor,
+        prev_reward: torch.Tensor,
+        episode_start: torch.Tensor,
+        inference_state: list[tuple[torch.Tensor, ...]],
+        action: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, ...]]]:
+        x = self.token_encoder(
+            obs.unsqueeze(1),
+            direction.unsqueeze(1),
+            prev_action.unsqueeze(1),
+            prev_reward.unsqueeze(1),
+            episode_start.unsqueeze(1),
+        )
+        new_state: list[tuple[torch.Tensor, ...]] = []
+        for cache, norm, block in zip(inference_state, self.block_norms, self.blocks):
+            out = block.step(norm(x), *cache)
+            block_out = out[0]
+            block_cache = tuple(out[1:])
+            _raise_if_nonfinite(block_out, "Mamba step output")
+            x = x + self.residual_scale * block_out
+            new_state.append(block_cache)
+
+        x = self.norm(x)
+        logits = _mask_logits(self, self.actor(x[:, -1]))
+        value = self.critic(x[:, -1]).squeeze(-1)
+        dist = _safe_categorical(logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value, new_state
 
     def get_action_and_value(
         self,
@@ -563,20 +682,32 @@ class FastGatedAttentionActorCritic(nn.Module):
         dropout: float = 0.0,
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
+        position_mode: str = "learned",
     ):
         super().__init__()
+        if position_mode not in {"learned", "none", "alibi"}:
+            raise ValueError("position_mode must be one of: learned, none, alibi.")
         self.action_dim = action_dim
         _register_action_mask(self, action_dim, valid_actions)
         self.context_len = context_len
+        self.position_mode = position_mode
+        self.n_heads = n_heads
+        self.d_model = d_model
         
         self.token_encoder = TokenEncoder(
             action_dim=action_dim, d_model=d_model, spatial_layers=spatial_layers,
             spatial_heads=spatial_heads, dropout=dropout, spatial_encoder=spatial_encoder,
         )
         
-        # 绝对位置编码 (对于 128 长度已经足够)
-        self.temporal_pos = nn.Parameter(torch.zeros(1, context_len, d_model))
-        nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+        if self.position_mode == "learned":
+            self.temporal_pos = nn.Parameter(torch.zeros(1, context_len, d_model))
+            nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+        else:
+            self.register_parameter("temporal_pos", None)
+        if self.position_mode == "alibi":
+            self.register_buffer("alibi_slopes", _build_alibi_slopes(n_heads), persistent=False)
+        else:
+            self.alibi_slopes = None
         
         # Gated Attention Blocks
         self.blocks = nn.ModuleList([
@@ -598,11 +729,12 @@ class FastGatedAttentionActorCritic(nn.Module):
         if seq_len > self.context_len:
             raise ValueError(f"Sequence length {seq_len} exceeds context_len {self.context_len}.")
             
-        x = x + self.temporal_pos[:, -seq_len:]
+        if self.temporal_pos is not None:
+            x = x + self.temporal_pos[:, -seq_len:]
         
         # 前向传播过 Gated Blocks
         for block in self.blocks:
-            x = block(x, is_causal=True)
+            x = block(x, is_causal=True, alibi_slopes=self.alibi_slopes)
             
         x = self.norm(x)
         return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
@@ -613,6 +745,75 @@ class FastGatedAttentionActorCritic(nn.Module):
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), values[:, -1]
+
+    def init_inference_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if self.position_mode == "learned":
+            raise RuntimeError("Stateful Gated Attention rollout requires --gated-attention-pos none or alibi.")
+        param = next(self.parameters())
+        device = device or param.device
+        dtype = dtype or param.dtype
+        states = []
+        for block in self.blocks:
+            cache_k = torch.zeros(
+                batch_size,
+                block.n_heads,
+                self.context_len,
+                block.head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            cache_v = torch.zeros_like(cache_k)
+            lengths = torch.zeros(batch_size, device=device, dtype=torch.long)
+            states.append((cache_k, cache_v, lengths))
+        return states
+
+    @staticmethod
+    def reset_inference_state(
+        inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None,
+        done_mask: torch.Tensor,
+    ) -> None:
+        if inference_state is None or done_mask.numel() == 0 or not done_mask.any():
+            return
+        for cache_k, cache_v, lengths in inference_state:
+            cache_k[done_mask] = 0
+            cache_v[done_mask] = 0
+            lengths[done_mask] = 0
+
+    def get_action_and_value_step(
+        self,
+        obs: torch.Tensor,
+        direction: torch.Tensor,
+        prev_action: torch.Tensor,
+        prev_reward: torch.Tensor,
+        episode_start: torch.Tensor,
+        inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        action: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        x = self.token_encoder(
+            obs.unsqueeze(1),
+            direction.unsqueeze(1),
+            prev_action.unsqueeze(1),
+            prev_reward.unsqueeze(1),
+            episode_start.unsqueeze(1),
+        )
+        new_state = []
+        for block, cache in zip(self.blocks, inference_state):
+            x, cache = block.forward_step(x, cache, alibi_slopes=self.alibi_slopes)
+            new_state.append(cache)
+
+        x = self.norm(x)
+        logits = _mask_logits(self, self.actor(x[:, -1]))
+        value = self.critic(x[:, -1]).squeeze(-1)
+        dist = _safe_categorical(logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value, new_state
     
 class AttentionActorCritic(nn.Module):
     """Spatial-attention + causal temporal-attention actor critic."""
@@ -734,6 +935,10 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             d_conv=getattr(cfg, "d_conv", 4),
             expand=getattr(cfg, "expand", 2),
             variant=getattr(cfg, "mamba_variant", "mamba"),
+            headdim=getattr(cfg, "mamba_headdim", 64),
+            ngroups=getattr(cfg, "mamba_ngroups", 1),
+            chunk_size=getattr(cfg, "mamba_chunk_size", 64),
+            rope_fraction=getattr(cfg, "mamba_rope_fraction", 0.5),
             spatial_layers=spatial_layers,
             spatial_heads=spatial_heads,
             dropout=dropout,
@@ -765,6 +970,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             dropout=dropout,
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
+            position_mode=getattr(cfg, "gated_attention_pos", "learned"),
         )
     
 
@@ -784,6 +990,96 @@ def _resolve_mamba_block(variant: str):
     if variant == "mamba3":
         return Mamba3Block
     raise ValueError(f"Unknown Mamba variant: {variant}")
+
+
+def _build_mamba_block(
+    *,
+    variant: str,
+    block_cls,
+    d_model: int,
+    d_state: int,
+    d_conv: int,
+    expand: int,
+    headdim: int,
+    ngroups: int,
+    chunk_size: int,
+    rope_fraction: float,
+    dropout: float,
+    layer_idx: int,
+):
+    if variant == "mamba":
+        return block_cls(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            layer_idx=layer_idx,
+        )
+    if variant == "mamba2":
+        return block_cls(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
+            ngroups=ngroups,
+            chunk_size=chunk_size,
+            layer_idx=layer_idx,
+        )
+    if variant == "mamba3":
+        return block_cls(
+            d_model=d_model,
+            d_state=d_state,
+            expand=expand,
+            headdim=headdim,
+            ngroups=ngroups,
+            rope_fraction=rope_fraction,
+            chunk_size=chunk_size,
+            dropout=dropout,
+            layer_idx=layer_idx,
+        )
+    raise ValueError(f"Unknown Mamba variant: {variant}")
+
+
+def _raise_if_nonfinite(tensor: torch.Tensor, name: str) -> None:
+    if hasattr(torch, "compiler") and torch.compiler.is_compiling():
+        return
+    if not torch.isfinite(tensor).all():
+        raise FloatingPointError(f"{name} contains NaN or Inf.")
+
+
+def _build_alibi_slopes(n_heads: int) -> torch.Tensor:
+    def slopes_power_of_two(power_heads: int) -> list[float]:
+        start = 2.0 ** (-2.0 ** -(math.log2(power_heads) - 3.0))
+        ratio = start
+        return [start * ratio**i for i in range(power_heads)]
+
+    if n_heads <= 0:
+        raise ValueError("n_heads must be positive.")
+    if math.log2(n_heads).is_integer():
+        slopes = slopes_power_of_two(n_heads)
+    else:
+        closest_power = 2 ** math.floor(math.log2(n_heads))
+        slopes = slopes_power_of_two(closest_power)
+        slopes += slopes_power_of_two(2 * closest_power)[0::2][: n_heads - closest_power]
+    return torch.tensor(slopes, dtype=torch.float32)
+
+
+def _alibi_attention_mask(
+    seq_len: int,
+    slopes: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    causal: bool,
+) -> torch.Tensor:
+    positions = torch.arange(seq_len, device=device)
+    age = (positions[:, None] - positions[None, :]).clamp_min(0)
+    bias = -slopes.to(device=device, dtype=dtype).view(1, -1, 1, 1) * age.to(dtype).view(1, 1, seq_len, seq_len)
+    if causal:
+        future = positions[None, :] > positions[:, None]
+        bias = bias.masked_fill(future.view(1, 1, seq_len, seq_len), torch.finfo(dtype).min)
+    return bias
 
 
 def _parse_valid_actions(value: Any) -> list[int] | None:

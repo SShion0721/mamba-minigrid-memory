@@ -48,7 +48,9 @@ def record_episodes(
     probe_env.close()
 
     model = build_actor_critic(cfg, action_dim=action_dim).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing or unexpected:
+        print(f"Checkpoint loaded with missing={missing} unexpected={unexpected}")
     model.eval()
 
     os.makedirs(save_dir, exist_ok=True)
@@ -197,14 +199,15 @@ def _pack_context(
     action_dim: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(obs_ctx)
-    obs_seq = np.zeros((1, context_len, 7, 7, 3), dtype=np.float32)
+    obs_shape = np.asarray(obs_ctx[0]).shape if n else (7, 7, 3)
+    obs_seq = np.zeros((1, context_len, *obs_shape), dtype=np.uint8)
     dir_seq = np.zeros((1, context_len, 1), dtype=np.int64)
     act_seq = np.zeros((1, context_len, action_dim), dtype=np.float32)
     rew_seq = np.zeros((1, context_len, 1), dtype=np.float32)
     start_seq = np.zeros((1, context_len, 1), dtype=np.float32)
 
     if n:
-        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.float32)
+        obs_seq[0, -n:] = np.asarray(list(obs_ctx), dtype=np.uint8)
         dir_seq[0, -n:] = np.asarray(list(dir_ctx), dtype=np.int64)
         act_seq[0, -n:] = np.asarray(list(act_ctx), dtype=np.float32)
         rew_seq[0, -n:] = np.asarray(list(rew_ctx), dtype=np.float32)
@@ -234,8 +237,13 @@ def _checkpoint_config(ckpt) -> SimpleNamespace:
     values.setdefault("d_state", 32)
     values.setdefault("d_conv", 4)
     values.setdefault("expand", 2)
+    values.setdefault("mamba_headdim", 64)
+    values.setdefault("mamba_ngroups", 1)
+    values.setdefault("mamba_chunk_size", 64)
+    values.setdefault("mamba_rope_fraction", 0.5)
     values.setdefault("attention_layers", 2)
     values.setdefault("attention_heads", 4)
+    values.setdefault("gated_attention_pos", "learned")
     values.setdefault("valid_actions", "0,1,2")
     return SimpleNamespace(**values)
 

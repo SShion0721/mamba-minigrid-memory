@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections import deque
+from contextlib import nullcontext
 from typing import Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from src.models import _safe_categorical
@@ -25,12 +24,14 @@ class RolloutBuffer:
         action_dim: int,
         context_len: int = 64,
     ):
+        if context_len <= 0:
+            raise ValueError("context_len must be positive.")
         self.num_envs = num_envs
         self.num_steps = num_steps
         self.context_len = context_len
         self.action_dim = action_dim
 
-        self.observations = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.float32)
+        self.observations = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.uint8)
         self.directions = np.zeros((num_steps, num_envs, 1), dtype=np.int64)
         self.actions = np.zeros((num_steps, num_envs), dtype=np.int64)
         self.prev_actions = np.zeros((num_steps, num_envs, action_dim), dtype=np.float32)
@@ -44,20 +45,31 @@ class RolloutBuffer:
         self.advantages: np.ndarray | None = None
         self.returns: np.ndarray | None = None
 
-        self.obs_history = [deque(maxlen=context_len) for _ in range(num_envs)]
-        self.dir_history = [deque(maxlen=context_len) for _ in range(num_envs)]
-        self.act_history = [deque(maxlen=context_len) for _ in range(num_envs)]
-        self.rew_history = [deque(maxlen=context_len) for _ in range(num_envs)]
-        self.start_history = [deque(maxlen=context_len) for _ in range(num_envs)]
+        self.context_obs = np.zeros((num_envs, context_len, *obs_shape), dtype=self.observations.dtype)
+        self.context_dirs = np.zeros((num_envs, context_len, 1), dtype=self.directions.dtype)
+        self.context_actions = np.zeros((num_envs, context_len, action_dim), dtype=self.prev_actions.dtype)
+        self.context_rewards = np.zeros((num_envs, context_len, 1), dtype=self.prev_rewards.dtype)
+        self.context_starts = np.zeros((num_envs, context_len, 1), dtype=self.episode_starts.dtype)
+
+        self.hist_obs = np.zeros_like(self.context_obs)
+        self.hist_dirs = np.zeros_like(self.context_dirs)
+        self.hist_actions = np.zeros_like(self.context_actions)
+        self.hist_rewards = np.zeros_like(self.context_rewards)
+        self.hist_starts = np.zeros_like(self.context_starts)
+        self.hist_pos = np.zeros(num_envs, dtype=np.int64)
+        self.hist_len = np.zeros(num_envs, dtype=np.int64)
+        self.env_indices = np.arange(num_envs)
 
         self.step = 0
 
     def reset_context(self, env_idx: int) -> None:
-        self.obs_history[env_idx].clear()
-        self.dir_history[env_idx].clear()
-        self.act_history[env_idx].clear()
-        self.rew_history[env_idx].clear()
-        self.start_history[env_idx].clear()
+        self.hist_pos[env_idx] = 0
+        self.hist_len[env_idx] = 0
+
+    def reset_contexts(self, done_mask: np.ndarray) -> None:
+        if done_mask.any():
+            self.hist_pos[done_mask] = 0
+            self.hist_len[done_mask] = 0
 
     def reset_rollout(self) -> None:
         self.step = 0
@@ -90,14 +102,53 @@ class RolloutBuffer:
         self.values[idx, env_idx] = value
         self.dones[idx, env_idx] = done
 
-        self.obs_history[env_idx].append(obs)
-        self.dir_history[env_idx].append(direction)
-        self.act_history[env_idx].append(prev_action)
-        self.rew_history[env_idx].append(prev_reward)
-        self.start_history[env_idx].append(episode_start)
+        pos = self.hist_pos[env_idx]
+        self.hist_obs[env_idx, pos] = obs
+        self.hist_dirs[env_idx, pos] = direction
+        self.hist_actions[env_idx, pos] = prev_action
+        self.hist_rewards[env_idx, pos] = prev_reward
+        self.hist_starts[env_idx, pos] = episode_start
+        self.hist_pos[env_idx] = (pos + 1) % self.context_len
+        self.hist_len[env_idx] = min(self.hist_len[env_idx] + 1, self.context_len)
 
         if done:
             self.reset_context(env_idx)
+
+    def add_batch(
+        self,
+        *,
+        obs: np.ndarray,
+        directions: np.ndarray,
+        actions: np.ndarray,
+        logprobs: np.ndarray,
+        values: np.ndarray,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        prev_actions: np.ndarray,
+        prev_rewards: np.ndarray,
+        episode_starts: np.ndarray,
+    ) -> None:
+        idx = self.step
+        self.observations[idx] = obs
+        self.directions[idx] = directions
+        self.actions[idx] = actions
+        self.prev_actions[idx] = prev_actions
+        self.prev_rewards[idx] = prev_rewards
+        self.episode_starts[idx] = episode_starts
+        self.logprobs[idx] = logprobs
+        self.rewards[idx] = rewards
+        self.values[idx] = values
+        self.dones[idx] = dones
+
+        cols = self.hist_pos
+        self.hist_obs[self.env_indices, cols] = obs
+        self.hist_dirs[self.env_indices, cols] = directions
+        self.hist_actions[self.env_indices, cols] = prev_actions
+        self.hist_rewards[self.env_indices, cols] = prev_rewards
+        self.hist_starts[self.env_indices, cols] = episode_starts
+        self.hist_pos = (self.hist_pos + 1) % self.context_len
+        self.hist_len = np.minimum(self.hist_len + 1, self.context_len)
+        self.reset_contexts(dones)
 
     def get_context(
         self,
@@ -110,34 +161,40 @@ class RolloutBuffer:
         """Return right-aligned context windows, optionally including current token."""
 
         ctx_len = self.context_len
-        obs_shape = self.observations.shape[2:]
-        obs_ctx = np.zeros((self.num_envs, ctx_len, *obs_shape), dtype=np.float32)
-        dir_ctx = np.zeros((self.num_envs, ctx_len, 1), dtype=np.int64)
-        act_ctx = np.zeros((self.num_envs, ctx_len, self.action_dim), dtype=np.float32)
-        rew_ctx = np.zeros((self.num_envs, ctx_len, 1), dtype=np.float32)
-        start_ctx = np.zeros((self.num_envs, ctx_len, 1), dtype=np.float32)
+        obs_ctx = self.context_obs
+        dir_ctx = self.context_dirs
+        act_ctx = self.context_actions
+        rew_ctx = self.context_rewards
+        start_ctx = self.context_starts
+        obs_ctx.fill(0)
+        dir_ctx.fill(0)
+        act_ctx.fill(0)
+        rew_ctx.fill(0)
+        start_ctx.fill(0)
 
+        include_current = current_obs is not None
+        hist_end = ctx_len - int(include_current)
         for env_idx in range(self.num_envs):
-            obs_list = list(self.obs_history[env_idx])
-            dir_list = list(self.dir_history[env_idx])
-            act_list = list(self.act_history[env_idx])
-            rew_list = list(self.rew_history[env_idx])
-            start_list = list(self.start_history[env_idx])
+            hist_take = min(int(self.hist_len[env_idx]), hist_end)
+            if hist_take:
+                dest = slice(hist_end - hist_take, hist_end)
+                _copy_ring_tail(self.hist_obs[env_idx], self.hist_pos[env_idx], hist_take, obs_ctx[env_idx, dest])
+                _copy_ring_tail(self.hist_dirs[env_idx], self.hist_pos[env_idx], hist_take, dir_ctx[env_idx, dest])
+                _copy_ring_tail(
+                    self.hist_actions[env_idx],
+                    self.hist_pos[env_idx],
+                    hist_take,
+                    act_ctx[env_idx, dest],
+                )
+                _copy_ring_tail(self.hist_rewards[env_idx], self.hist_pos[env_idx], hist_take, rew_ctx[env_idx, dest])
+                _copy_ring_tail(self.hist_starts[env_idx], self.hist_pos[env_idx], hist_take, start_ctx[env_idx, dest])
 
-            if current_obs is not None:
-                obs_list.append(current_obs[env_idx])
-                dir_list.append(current_directions[env_idx])
-                act_list.append(current_prev_actions[env_idx])
-                rew_list.append(current_prev_rewards[env_idx])
-                start_list.append(current_episode_starts[env_idx])
-
-            n = min(len(obs_list), ctx_len)
-            if n:
-                obs_ctx[env_idx, -n:] = np.asarray(obs_list[-n:], dtype=np.float32)
-                dir_ctx[env_idx, -n:] = np.asarray(dir_list[-n:], dtype=np.int64)
-                act_ctx[env_idx, -n:] = np.asarray(act_list[-n:], dtype=np.float32)
-                rew_ctx[env_idx, -n:] = np.asarray(rew_list[-n:], dtype=np.float32)
-                start_ctx[env_idx, -n:] = np.asarray(start_list[-n:], dtype=np.float32)
+        if include_current:
+            obs_ctx[:, -1] = current_obs
+            dir_ctx[:, -1] = current_directions
+            act_ctx[:, -1] = current_prev_actions
+            rew_ctx[:, -1] = current_prev_rewards
+            start_ctx[:, -1] = current_episode_starts
 
         return obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx
 
@@ -165,6 +222,18 @@ class RolloutBuffer:
         return self.advantages, self.returns
 
 
+def _copy_ring_tail(history: np.ndarray, next_pos: int, count: int, dest: np.ndarray) -> None:
+    start = (int(next_pos) - count) % history.shape[0]
+    end = start + count
+    if end <= history.shape[0]:
+        dest[...] = history[start:end]
+        return
+
+    first = history.shape[0] - start
+    dest[:first] = history[start:]
+    dest[first:] = history[: count - first]
+
+
 class PPOTrainer:
     """PPO updates for feedforward and sequence policies."""
 
@@ -180,6 +249,9 @@ class PPOTrainer:
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         target_kl: float | None = None,
+        clip_vloss: bool = True,
+        norm_adv: bool = True,
+        amp_dtype: torch.dtype | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -190,6 +262,10 @@ class PPOTrainer:
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
+        self.clip_vloss = clip_vloss
+        self.norm_adv = norm_adv
+        self.amp_dtype = amp_dtype if device.type == "cuda" else None
+        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.amp_dtype == torch.float16)
         self.global_step = 0
 
     def train_feedforward(self, buffer: RolloutBuffer, batch_size: int, n_epochs: int) -> None:
@@ -217,7 +293,7 @@ class PPOTrainer:
         b_prev_rewards = buffer.prev_rewards.reshape(-1, 1)
         b_episode_starts = buffer.episode_starts.reshape(-1, 1)
         b_logprobs = buffer.logprobs.reshape(-1)
-        b_advantages = _normalize(buffer.advantages.reshape(-1))
+        b_advantages = buffer.advantages.reshape(-1)
         b_returns = buffer.returns.reshape(-1)
         b_values = buffer.values.reshape(-1)
 
@@ -232,14 +308,15 @@ class PPOTrainer:
                 if len(mb_idx) == 0:
                     continue
 
-                _, new_logprob, entropy, new_value = self.model.get_action_and_value(
-                    torch.as_tensor(b_obs[mb_idx], device=self.device),
-                    torch.as_tensor(b_directions[mb_idx], device=self.device),
-                    torch.as_tensor(b_prev_actions[mb_idx], device=self.device),
-                    torch.as_tensor(b_prev_rewards[mb_idx], device=self.device),
-                    torch.as_tensor(b_episode_starts[mb_idx], device=self.device),
-                    action=torch.as_tensor(b_actions[mb_idx], device=self.device).long(),
-                )
+                with self._autocast():
+                    _, new_logprob, entropy, new_value = self.model.get_action_and_value(
+                        torch.as_tensor(b_obs[mb_idx], device=self.device),
+                        torch.as_tensor(b_directions[mb_idx], device=self.device),
+                        torch.as_tensor(b_prev_actions[mb_idx], device=self.device),
+                        torch.as_tensor(b_prev_rewards[mb_idx], device=self.device),
+                        torch.as_tensor(b_episode_starts[mb_idx], device=self.device),
+                        action=torch.as_tensor(b_actions[mb_idx], device=self.device).long(),
+                    )
 
                 stop = self._update_minibatch(
                     new_logprob=new_logprob,
@@ -283,16 +360,20 @@ class PPOTrainer:
             raise RuntimeError("Call buffer.compute_gae(...) before PPO updates.")
 
         chunk_len = min(chunk_len, buffer.num_steps)
+        burn_in_len = max(0, buffer.context_len - chunk_len)
+        sequence_len = chunk_len + burn_in_len
         chunks = _episode_bounded_chunks(buffer, chunk_len)
         if not chunks:
-            chunks = [(env_idx, 0, buffer.num_steps) for env_idx in range(buffer.num_envs)]
+            chunks = [(env_idx, 0, 0, buffer.num_steps) for env_idx in range(buffer.num_envs)]
 
-        real_tokens = sum(end - start for _, start, end in chunks)
-        padded_tokens = max(1, len(chunks) * chunk_len)
+        real_tokens = sum(end - max(segment_start, start - burn_in_len) for _, segment_start, start, end in chunks)
+        target_tokens = sum(end - start for _, _, start, end in chunks)
+        padded_tokens = max(1, len(chunks) * sequence_len)
         self.writer.add_scalar("charts/sequence_chunks", len(chunks), self.global_step)
         self.writer.add_scalar("charts/sequence_real_token_fraction", real_tokens / padded_tokens, self.global_step)
+        self.writer.add_scalar("charts/sequence_target_token_fraction", target_tokens / padded_tokens, self.global_step)
 
-        normalized_advantages = _normalize(buffer.advantages)
+        advantages = buffer.advantages
         total_batches = n_epochs * max(1, (len(chunks) + batch_chunks - 1) // batch_chunks)
         batch_counter = 0
 
@@ -315,18 +396,19 @@ class PPOTrainer:
                     ret_seq,
                     old_value_seq,
                     loss_mask,
-                ) = _pack_sequence_batch(buffer, selected, normalized_advantages, chunk_len)
+                ) = _pack_sequence_batch(buffer, selected, advantages, chunk_len, burn_in_len)
 
-                logits, new_values = self.model.forward(
-                    torch.as_tensor(obs_seq, device=self.device),
-                    torch.as_tensor(dir_seq, device=self.device),
-                    torch.as_tensor(prev_act_seq, device=self.device),
-                    torch.as_tensor(prev_rew_seq, device=self.device),
-                    torch.as_tensor(ep_start_seq, device=self.device),
-                )
-                dist = _safe_categorical(logits)
-                new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
-                entropy = dist.entropy()
+                with self._autocast():
+                    logits, new_values = self.model.forward(
+                        torch.as_tensor(obs_seq, device=self.device),
+                        torch.as_tensor(dir_seq, device=self.device),
+                        torch.as_tensor(prev_act_seq, device=self.device),
+                        torch.as_tensor(prev_rew_seq, device=self.device),
+                        torch.as_tensor(ep_start_seq, device=self.device),
+                    )
+                    dist = _safe_categorical(logits)
+                    new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
+                    entropy = dist.entropy()
 
                 stop = self._update_minibatch(
                     new_logprob=new_logprob,
@@ -368,89 +450,151 @@ class PPOTrainer:
             def reduce_loss(x: torch.Tensor) -> torch.Tensor:
                 return x.mean()
 
+        if self.norm_adv:
+            with torch.no_grad():
+                if loss_mask is not None:
+                    adv_mean = reduce_loss(advantages)
+                    adv_var = reduce_loss((advantages - adv_mean) ** 2)
+                    advantages = (advantages - adv_mean) / torch.sqrt(adv_var + 1e-8)
+                else:
+                    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
         logratio = new_logprob - old_logprob
         ratio = logratio.exp()
 
         with torch.no_grad():
+            old_approx_kl = reduce_loss(-logratio)
             approx_kl = reduce_loss((ratio - 1.0) - logratio)
+            clipfrac = reduce_loss(((ratio - 1.0).abs() > self.clip_coef).float())
 
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
         pg_loss = reduce_loss(torch.max(pg_loss1, pg_loss2))
 
-        value_loss = 0.5 * reduce_loss((new_value - returns) ** 2)
+        if self.clip_vloss:
+            value_loss_unclipped = (new_value - returns) ** 2
+            value_clipped = old_values + torch.clamp(new_value - old_values, -self.clip_coef, self.clip_coef)
+            value_loss_clipped = (value_clipped - returns) ** 2
+            value_loss = 0.5 * reduce_loss(torch.max(value_loss_unclipped, value_loss_clipped))
+        else:
+            value_loss = 0.5 * reduce_loss((new_value - returns) ** 2)
 
         entropy_loss = reduce_loss(entropy)
         loss = pg_loss - self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+
+        with torch.no_grad():
+            explained_var = _explained_variance(new_value.detach(), returns.detach(), loss_mask)
 
         self.writer.add_scalar("loss/policy", pg_loss.item(), self.global_step)
         self.writer.add_scalar("loss/value", value_loss.item(), self.global_step)
         self.writer.add_scalar("loss/entropy", entropy_loss.item(), self.global_step)
         self.writer.add_scalar("loss/total", loss.item(), self.global_step)
+        self.writer.add_scalar("loss/old_approx_kl", old_approx_kl.item(), self.global_step)
         self.writer.add_scalar("loss/approx_kl", approx_kl.item(), self.global_step)
+        self.writer.add_scalar("loss/clipfrac", clipfrac.item(), self.global_step)
+        self.writer.add_scalar("loss/explained_variance", explained_var, self.global_step)
         self.global_step += 1
 
         return self.target_kl is not None and approx_kl.item() > self.target_kl
 
+    def _autocast(self):
+        if self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
-def _normalize(x: np.ndarray) -> np.ndarray:
-    return (x - x.mean()) / (x.std() + 1e-8)
+
+def _explained_variance(predicted: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor | None) -> float:
+    if loss_mask is not None:
+        keep = loss_mask.bool()
+        predicted = predicted[keep]
+        target = target[keep]
+    if target.numel() == 0:
+        return float("nan")
+    target_var = torch.var(target, unbiased=False)
+    if target_var <= 0:
+        return float("nan")
+    return float((1.0 - torch.var(target - predicted, unbiased=False) / target_var).item())
 
 
-def _episode_bounded_chunks(buffer: RolloutBuffer, chunk_len: int) -> list[tuple[int, int, int]]:
-    """Build chunks that do not cross terminal transitions.
+def _episode_bounded_chunks(buffer: RolloutBuffer, chunk_len: int) -> list[tuple[int, int, int, int]]:
+    """Build chunks that do not cross episode boundaries.
 
     Short episode fragments are kept and padded later, so sequence PPO does not
     throw away most data when episodes are shorter than the target chunk length.
     """
 
-    chunks: list[tuple[int, int, int]] = []
+    chunks: list[tuple[int, int, int, int]] = []
+
+    def append_segment(env_idx: int, segment_start: int, segment_end: int) -> None:
+        start = segment_start
+        while start < segment_end:
+            end = min(start + chunk_len, segment_end)
+            chunks.append((env_idx, segment_start, start, end))
+            start = end
+
     for env_idx in range(buffer.num_envs):
         segment_start = 0
         for step in range(buffer.num_steps):
+            starts_new_episode = (
+                step > segment_start
+                and buffer.episode_starts[step, env_idx, 0] > 0.5
+            )
+            if starts_new_episode:
+                append_segment(env_idx, segment_start, step)
+                segment_start = step
+
             segment_end = step + 1
             if buffer.dones[step, env_idx] or step == buffer.num_steps - 1:
-                start = segment_start
-                while start < segment_end:
-                    end = min(start + chunk_len, segment_end)
-                    chunks.append((env_idx, start, end))
-                    start = end
+                append_segment(env_idx, segment_start, segment_end)
                 segment_start = segment_end
     return chunks
 
 
 def _pack_sequence_batch(
     buffer: RolloutBuffer,
-    selected: list[tuple[int, int, int]],
-    normalized_advantages: np.ndarray,
+    selected: list[tuple[int, int, int, int]],
+    advantages: np.ndarray,
     chunk_len: int,
+    burn_in_len: int,
 ) -> tuple[np.ndarray, ...]:
     batch_size = len(selected)
     obs_shape = buffer.observations.shape[2:]
+    sequence_len = chunk_len + burn_in_len
 
-    obs_seq = np.zeros((batch_size, chunk_len, *obs_shape), dtype=buffer.observations.dtype)
-    dir_seq = np.zeros((batch_size, chunk_len, 1), dtype=buffer.directions.dtype)
-    prev_act_seq = np.zeros((batch_size, chunk_len, buffer.action_dim), dtype=buffer.prev_actions.dtype)
-    prev_rew_seq = np.zeros((batch_size, chunk_len, 1), dtype=buffer.prev_rewards.dtype)
-    ep_start_seq = np.zeros((batch_size, chunk_len, 1), dtype=buffer.episode_starts.dtype)
-    action_seq = np.zeros((batch_size, chunk_len), dtype=buffer.actions.dtype)
-    old_logprob_seq = np.zeros((batch_size, chunk_len), dtype=buffer.logprobs.dtype)
-    adv_seq = np.zeros((batch_size, chunk_len), dtype=normalized_advantages.dtype)
-    ret_seq = np.zeros((batch_size, chunk_len), dtype=buffer.returns.dtype)
-    old_value_seq = np.zeros((batch_size, chunk_len), dtype=buffer.values.dtype)
-    loss_mask = np.zeros((batch_size, chunk_len), dtype=np.float32)
+    obs_seq = np.zeros((batch_size, sequence_len, *obs_shape), dtype=buffer.observations.dtype)
+    dir_seq = np.zeros((batch_size, sequence_len, 1), dtype=buffer.directions.dtype)
+    prev_act_seq = np.zeros((batch_size, sequence_len, buffer.action_dim), dtype=buffer.prev_actions.dtype)
+    prev_rew_seq = np.zeros((batch_size, sequence_len, 1), dtype=buffer.prev_rewards.dtype)
+    ep_start_seq = np.zeros((batch_size, sequence_len, 1), dtype=buffer.episode_starts.dtype)
+    action_seq = np.zeros((batch_size, sequence_len), dtype=buffer.actions.dtype)
+    old_logprob_seq = np.zeros((batch_size, sequence_len), dtype=buffer.logprobs.dtype)
+    adv_seq = np.zeros((batch_size, sequence_len), dtype=advantages.dtype)
+    ret_seq = np.zeros((batch_size, sequence_len), dtype=buffer.returns.dtype)
+    old_value_seq = np.zeros((batch_size, sequence_len), dtype=buffer.values.dtype)
+    loss_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
 
-    for batch_idx, (env_idx, start, end) in enumerate(selected):
-        length = end - start
-        if length <= 0:
+    for batch_idx, (env_idx, segment_start, start, end) in enumerate(selected):
+        burn_start = max(segment_start, start - burn_in_len)
+        sequence_end = end
+        sequence_length = sequence_end - burn_start
+        target_start = start - burn_start
+        target_length = end - start
+        if sequence_length <= 0 or target_length <= 0:
             continue
-        dest = slice(0, length)
-        src = slice(start, end)
+        dest = slice(0, sequence_length)
+        src = slice(burn_start, sequence_end)
         obs_seq[batch_idx, dest] = buffer.observations[src, env_idx]
         dir_seq[batch_idx, dest] = buffer.directions[src, env_idx]
         prev_act_seq[batch_idx, dest] = buffer.prev_actions[src, env_idx]
@@ -458,10 +602,10 @@ def _pack_sequence_batch(
         ep_start_seq[batch_idx, dest] = buffer.episode_starts[src, env_idx]
         action_seq[batch_idx, dest] = buffer.actions[src, env_idx]
         old_logprob_seq[batch_idx, dest] = buffer.logprobs[src, env_idx]
-        adv_seq[batch_idx, dest] = normalized_advantages[src, env_idx]
+        adv_seq[batch_idx, dest] = advantages[src, env_idx]
         ret_seq[batch_idx, dest] = buffer.returns[src, env_idx]
         old_value_seq[batch_idx, dest] = buffer.values[src, env_idx]
-        loss_mask[batch_idx, dest] = 1.0
+        loss_mask[batch_idx, target_start : target_start + target_length] = 1.0
 
     return (
         obs_seq,

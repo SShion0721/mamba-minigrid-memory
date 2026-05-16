@@ -14,7 +14,12 @@ param(
     [string]$SpatialEncoder = "hybrid",
     [int]$MambaLayers = 2,
     [int]$DState = 64,
+    [int]$MambaHeadDim = 64,
+    [int]$MambaNGroups = 1,
+    [int]$MambaChunkSize = 64,
     [string]$MambaVariant = "mamba3",
+    [ValidateSet("learned", "none", "alibi")]
+    [string]$GatedAttentionPos = "learned",
     [string]$CudaVisibleDevices = "0",
     [int]$SaveInterval = 50000,
     [int]$EvalInterval = 500000,
@@ -23,8 +28,12 @@ param(
     [string]$ValidActions = "0,1,2",
     [double]$EntCoef = 0.01,
     [double]$EntCoefFinal = 0.001,
+    [ValidateSet("none", "bf16", "fp16")]
+    [string]$Amp = "none",
     [string]$ResumeFrom = "",
     [string]$FallbackVariant = "mamba2",
+    [switch]$Compile,
+    [switch]$NoStatefulRollout,
     [switch]$NoFallback
 )
 
@@ -44,7 +53,7 @@ New-Item -ItemType Directory -Force -Path $env:TRITON_CACHE_DIR | Out-Null
 Write-Host "Triton cache: $env:TRITON_CACHE_DIR"
 
 $RequestedVariant = $MambaVariant
-$PreflightCode = "from mamba_ssm import Mamba, Mamba2, Mamba3; cls={'mamba':Mamba,'mamba2':Mamba2,'mamba3':Mamba3}['$MambaVariant']; cls(d_model=$DModel,d_state=$DState,d_conv=4,expand=2); print('$MambaVariant preflight ok')"
+$PreflightCode = "from mamba_ssm import Mamba, Mamba2, Mamba3; variant='$MambaVariant'; builders={'mamba': lambda: Mamba(d_model=$DModel, d_state=$DState, d_conv=4, expand=2), 'mamba2': lambda: Mamba2(d_model=$DModel, d_state=$DState, d_conv=4, expand=2, headdim=$MambaHeadDim, ngroups=$MambaNGroups, chunk_size=$MambaChunkSize), 'mamba3': lambda: Mamba3(d_model=$DModel, d_state=$DState, expand=2, headdim=$MambaHeadDim, ngroups=$MambaNGroups, chunk_size=$MambaChunkSize)}; builders[variant](); print(f'{variant} preflight ok')"
 & micromamba run -n $EnvName python -c $PreflightCode
 if ($LASTEXITCODE -ne 0) {
     if ($NoFallback -or -not $FallbackVariant) {
@@ -57,7 +66,7 @@ if ($LASTEXITCODE -ne 0) {
     } else {
         $RunName = "$RunName`_$MambaVariant"
     }
-    $PreflightCode = "from mamba_ssm import Mamba, Mamba2; cls={'mamba':Mamba,'mamba2':Mamba2}['$MambaVariant']; cls(d_model=$DModel,d_state=$DState,d_conv=4,expand=2); print('$MambaVariant preflight ok')"
+    $PreflightCode = "from mamba_ssm import Mamba, Mamba2; variant='$MambaVariant'; builders={'mamba': lambda: Mamba(d_model=$DModel, d_state=$DState, d_conv=4, expand=2), 'mamba2': lambda: Mamba2(d_model=$DModel, d_state=$DState, d_conv=4, expand=2, headdim=$MambaHeadDim, ngroups=$MambaNGroups, chunk_size=$MambaChunkSize)}; builders[variant](); print(f'{variant} preflight ok')"
     & micromamba run -n $EnvName python -c $PreflightCode
     if ($LASTEXITCODE -ne 0) {
         throw "Fallback Mamba variant '$MambaVariant' also failed preflight."
@@ -94,9 +103,14 @@ $ArgsList = @(
     "--d-state", "$DState",
     "--d-conv", "4",
     "--expand", "2",
+    "--mamba-headdim", "$MambaHeadDim",
+    "--mamba-ngroups", "$MambaNGroups",
+    "--mamba-chunk-size", "$MambaChunkSize",
+    "--gated-attention-pos", "$GatedAttentionPos",
     "--lr", "1e-4",
     "--ent-coef", "$EntCoef",
     "--ent-coef-final", "$EntCoefFinal",
+    "--amp", "$Amp",
     "--eval-interval", "$EvalInterval",
     "--eval-episodes", "$EvalEpisodes",
     "--save-interval", "$SaveInterval",
@@ -107,6 +121,12 @@ $ArgsList = @(
 
 if ($ResumeFrom) {
     $ArgsList += @("--resume-from", $ResumeFrom)
+}
+if ($Compile) {
+    $ArgsList += @("--compile")
+}
+if ($NoStatefulRollout) {
+    $ArgsList += @("--no-stateful-rollout")
 }
 
 Write-Host "Repo: $RepoRoot"

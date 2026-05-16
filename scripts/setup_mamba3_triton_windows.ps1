@@ -33,7 +33,7 @@ print("has set_allocator", hasattr(triton, "set_allocator"))
 
 from mamba_ssm import Mamba3
 
-model = Mamba3(d_model=128, d_state=64, d_conv=4, expand=2).cuda()
+model = Mamba3(d_model=128, d_state=64, expand=2, headdim=64, ngroups=1, chunk_size=64).cuda()
 x = torch.randn(2, 16, 128, device="cuda")
 y = model(x)
 loss = y.float().square().mean()
