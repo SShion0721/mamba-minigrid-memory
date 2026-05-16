@@ -93,6 +93,15 @@ class Config:
     attention_heads: int = 4
     gated_attention_pos: str = "learned"
     slot_count: int = 4
+    slot_extractor: str = "iterative"
+    slot_iters: int = 3
+    slot_mlp_ratio: float = 2.0
+    temporal_token_mode: str = "fuse"
+    memory_kind: str = "episodic_cue"
+    memory_slots: int = 16
+    memory_topk: int = 4
+    memory_write_window: int = 12
+    aux_recall_coef: float = 0.05
     valid_actions: str = "0,1,2"
     stateful_rollout: bool = True
     torch_compile: bool = False
@@ -214,6 +223,7 @@ def train(config: Config) -> None:
         clip_vloss=config.clip_vloss,
         norm_adv=config.norm_adv,
         amp_dtype=amp_dtype,
+        aux_recall_coef=config.aux_recall_coef,
     )
 
     obs_buf = np.zeros((config.num_envs, *obs_shape), dtype=np.uint8)
@@ -283,6 +293,8 @@ def train(config: Config) -> None:
         f"rollout={config.num_steps} context={config.context_len} "
         f"chunk={config.chunk_len} batch_chunks={config.batch_chunks} "
         f"spatial={config.spatial_encoder} valid_actions={config.valid_actions} "
+        f"slots={config.slot_extractor}/{config.slot_count} token_mode={config.temporal_token_mode} "
+        f"memory={config.memory_kind} aux={config.aux_recall_coef} "
         f"gated_pos={config.gated_attention_pos} "
         f"amp={config.amp} compile={config.torch_compile} stateful={use_stateful_rollout}",
         flush=True,
@@ -796,7 +808,10 @@ def _bootstrap_value(
                 torch.as_tensor(context[4], device=device),
                 valid_mask=torch.as_tensor(context[5], device=device),
             )
-            return values[:, -1].float().cpu().numpy()
+            mask_t = torch.as_tensor(context[5], device=device)
+            last_idx = mask_t.long().sum(dim=1).clamp(min=1, max=values.shape[1]) - 1
+            rows = torch.arange(values.shape[0], device=device)
+            return values[rows, last_idx].float().cpu().numpy()
 
         _, next_value = model.forward(
             torch.as_tensor(obs_buf, device=device),
@@ -958,6 +973,8 @@ def _default_run_name(config: Config) -> str:
     model_name = config.model
     if config.model == "mamba" and config.mamba_variant != "mamba":
         model_name = config.mamba_variant
+    if config.memory_kind == "episodic_cue" and config.slot_extractor == "iterative":
+        model_name = f"slot_memory_{model_name}"
     return f"{model_name}_{env_name}_seed{config.seed}"
 
 
@@ -1016,6 +1033,15 @@ def _apply_checkpoint_arch_config(config: Config, ckpt) -> None:
         "spatial_layers",
         "spatial_heads",
         "slot_count",
+        "slot_extractor",
+        "slot_iters",
+        "slot_mlp_ratio",
+        "temporal_token_mode",
+        "memory_kind",
+        "memory_slots",
+        "memory_topk",
+        "memory_write_window",
+        "aux_recall_coef",
         "mamba_variant",
         "mamba_layers",
         "d_model",
@@ -1157,6 +1183,15 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--gated-attention-pos", type=str, default="learned", choices=["learned", "none", "alibi"])
     parser.add_argument("--slot-count", type=int, default=4, help="Number of learned spatial slot tokens per step before the global decision token.")
+    parser.add_argument("--slot-extractor", type=str, default="iterative", choices=["query_pool", "iterative"])
+    parser.add_argument("--slot-iters", type=int, default=3)
+    parser.add_argument("--slot-mlp-ratio", type=float, default=2.0)
+    parser.add_argument("--temporal-token-mode", type=str, default="fuse", choices=["flatten", "fuse"])
+    parser.add_argument("--memory-kind", type=str, default="episodic_cue", choices=["none", "episodic_cue"])
+    parser.add_argument("--memory-slots", type=int, default=16)
+    parser.add_argument("--memory-topk", type=int, default=4)
+    parser.add_argument("--memory-write-window", type=int, default=12)
+    parser.add_argument("--aux-recall-coef", type=float, default=0.05)
     parser.add_argument(
         "--valid-actions",
         type=str,
@@ -1231,6 +1266,15 @@ def parse_args(default_model: str = "mamba") -> Config:
         attention_heads=args.attention_heads,
         gated_attention_pos=args.gated_attention_pos,
         slot_count=args.slot_count,
+        slot_extractor=args.slot_extractor,
+        slot_iters=args.slot_iters,
+        slot_mlp_ratio=args.slot_mlp_ratio,
+        temporal_token_mode=args.temporal_token_mode,
+        memory_kind=args.memory_kind,
+        memory_slots=args.memory_slots,
+        memory_topk=args.memory_topk,
+        memory_write_window=args.memory_write_window,
+        aux_recall_coef=args.aux_recall_coef,
         valid_actions=args.valid_actions,
         stateful_rollout=args.stateful_rollout,
         torch_compile=args.torch_compile,

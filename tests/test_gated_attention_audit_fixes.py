@@ -69,6 +69,7 @@ def test_pack_sequence_batch_left_aligns_valid_and_loss_masks():
         valid_mask,
         loss_mask,
         lengths,
+        _cue_target_seq,
     ) = _pack_sequence_batch(buffer, [(0, 0, 2, 4)], advantages, chunk_len=4, burn_in_len=4)
 
     assert obs_seq.shape[1] == 8

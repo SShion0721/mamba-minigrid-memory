@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 
+from src.cue import CUE_CLASS_COUNT, CUE_IGNORE_INDEX, extract_cue_targets_torch
+
 try:
     from mamba_ssm import Mamba as MambaBlock
     try:
@@ -68,12 +70,19 @@ class MiniGridSpatialEncoder(nn.Module):
         dropout: float = 0.0,
         encoder_type: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.spatial_layers = spatial_layers
         self.encoder_type = encoder_type
         self.slot_count = max(0, int(slot_count))
+        if slot_extractor not in {"query_pool", "iterative"}:
+            raise ValueError("slot_extractor must be one of: query_pool, iterative.")
+        self.slot_extractor = slot_extractor
+        self.slot_iters = max(1, int(slot_iters))
 
         self.obj_emb = nn.Embedding(32, 24)
         self.color_emb = nn.Embedding(16, 16)
@@ -87,10 +96,26 @@ class MiniGridSpatialEncoder(nn.Module):
             self.slot_queries = nn.Parameter(torch.zeros(1, self.slot_count, d_model))
             self.slot_source_norm = nn.LayerNorm(d_model)
             self.slot_norm = nn.LayerNorm(d_model)
+            if self.slot_extractor == "iterative":
+                slot_hidden = max(d_model, int(d_model * slot_mlp_ratio))
+                self.slot_gru = nn.GRUCell(d_model, d_model)
+                self.slot_update_norm = nn.LayerNorm(d_model)
+                self.slot_mlp = nn.Sequential(
+                    layer_init(nn.Linear(d_model, slot_hidden)),
+                    nn.GELU(),
+                    layer_init(nn.Linear(slot_hidden, d_model)),
+                )
+            else:
+                self.slot_gru = None
+                self.slot_update_norm = None
+                self.slot_mlp = None
         else:
             self.register_parameter("slot_queries", None)
             self.slot_source_norm = None
             self.slot_norm = None
+            self.slot_gru = None
+            self.slot_update_norm = None
+            self.slot_mlp = None
 
         if encoder_type == "transformer" and spatial_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -211,6 +236,20 @@ class MiniGridSpatialEncoder(nn.Module):
             return None
         queries = self.slot_queries.expand(tokens.shape[0], -1, -1) + direction_token
         source = self.slot_source_norm(tokens)
+        if self.slot_extractor == "iterative":
+            slots = queries
+            for _ in range(self.slot_iters):
+                slots_prev = slots
+                logits = torch.matmul(self.slot_norm(slots), source.transpose(-2, -1)) / math.sqrt(self.d_model)
+                attn = torch.softmax(logits, dim=1)
+                attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                updates = torch.matmul(attn, tokens)
+                slots = self.slot_gru(
+                    updates.reshape(-1, self.d_model),
+                    slots_prev.reshape(-1, self.d_model),
+                ).reshape_as(slots_prev)
+                slots = slots + self.slot_mlp(self.slot_update_norm(slots))
+            return self.slot_norm(slots)
         weights = torch.softmax(torch.matmul(queries, source.transpose(-2, -1)) / math.sqrt(self.d_model), dim=-1)
         return self.slot_norm(torch.matmul(weights, tokens))
 
@@ -235,6 +274,172 @@ class _SpatialConvBlock(nn.Module):
         return x + self.dropout(y)
 
 
+class EpisodicCueMemory(nn.Module):
+    """Small episode-local cue memory built only from visible observations."""
+
+    def __init__(
+        self,
+        d_model: int,
+        memory_slots: int = 16,
+        topk: int = 4,
+        write_window: int = 12,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.memory_slots = max(1, int(memory_slots))
+        self.topk = max(1, int(topk))
+        self.write_window = max(1, int(write_window))
+        self.key_proj = layer_init(nn.Linear(d_model, d_model))
+        self.value_emb = nn.Embedding(CUE_CLASS_COUNT, d_model)
+        self.read_proj = layer_init(nn.Linear(d_model, d_model))
+        self.gate = nn.Sequential(
+            nn.LayerNorm(2 * d_model),
+            layer_init(nn.Linear(2 * d_model, d_model)),
+            nn.Sigmoid(),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+        nn.init.normal_(self.value_emb.weight, std=0.02)
+        self.last_gate_mean = 0.0
+        self.last_retrieval_entropy = 0.0
+
+    def init_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "keys": torch.zeros(batch_size, self.memory_slots, self.d_model, device=device, dtype=dtype),
+            "vals": torch.zeros(batch_size, self.memory_slots, self.d_model, device=device, dtype=dtype),
+            "valid": torch.zeros(batch_size, self.memory_slots, device=device, dtype=torch.bool),
+            "ptr": torch.zeros(batch_size, device=device, dtype=torch.long),
+            "age": torch.zeros(batch_size, device=device, dtype=torch.long),
+            "episode_cue": torch.full(
+                (batch_size,),
+                CUE_IGNORE_INDEX,
+                device=device,
+                dtype=torch.long,
+            ),
+        }
+
+    @staticmethod
+    def reset_state(state: dict[str, torch.Tensor] | None, done_mask: torch.Tensor) -> None:
+        if state is None or done_mask.numel() == 0 or not done_mask.any():
+            return
+        for key in ("keys", "vals", "valid"):
+            state[key][done_mask] = 0
+        state["ptr"][done_mask] = 0
+        state["age"][done_mask] = 0
+        state["episode_cue"][done_mask] = CUE_IGNORE_INDEX
+
+    def forward(
+        self,
+        step_tokens: torch.Tensor,
+        obs_seq: torch.Tensor,
+        episode_start_seq: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = step_tokens.shape
+        state = self.init_state(
+            batch,
+            device=step_tokens.device,
+            dtype=step_tokens.dtype,
+        )
+        cue_targets = extract_cue_targets_torch(obs_seq)
+        outputs = []
+        gate_stats = []
+        entropy_stats = []
+        for idx in range(seq_len):
+            valid = None if valid_mask is None else valid_mask[:, idx].to(device=step_tokens.device).bool()
+            out, state, gate_mean, entropy = self.forward_step(
+                step_tokens[:, idx],
+                cue_targets[:, idx],
+                episode_start_seq[:, idx],
+                state,
+                valid,
+            )
+            outputs.append(out)
+            gate_stats.append(gate_mean)
+            entropy_stats.append(entropy)
+        if gate_stats and not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
+            self.last_gate_mean = float(torch.stack(gate_stats).mean().detach().cpu())
+            self.last_retrieval_entropy = float(torch.stack(entropy_stats).mean().detach().cpu())
+        return torch.stack(outputs, dim=1)
+
+    def forward_step(
+        self,
+        step_token: torch.Tensor,
+        cue_target: torch.Tensor,
+        episode_start: torch.Tensor,
+        state: dict[str, torch.Tensor] | None,
+        valid: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        if state is None:
+            state = self.init_state(
+                step_token.shape[0],
+                device=step_token.device,
+                dtype=step_token.dtype,
+            )
+        episode_start = episode_start.reshape(step_token.shape[0], -1)[:, 0].to(device=step_token.device) > 0.5
+        self.reset_state(state, episode_start)
+        if valid is None:
+            valid = torch.ones(step_token.shape[0], device=step_token.device, dtype=torch.bool)
+        else:
+            valid = valid.to(device=step_token.device).bool()
+
+        retrieved, entropy = self._read(step_token, state)
+        gate = self.gate(torch.cat([step_token, retrieved], dim=-1))
+        enhanced = self.out_norm(step_token + gate * self.read_proj(retrieved))
+
+        current_target = cue_target.to(device=step_token.device).long()
+        has_new_cue = (state["episode_cue"] == CUE_IGNORE_INDEX) & (current_target != CUE_IGNORE_INDEX)
+        in_write_window = state["age"] < self.write_window
+        write_mask = valid & has_new_cue & in_write_window
+        if write_mask.any():
+            state["episode_cue"] = torch.where(write_mask, current_target, state["episode_cue"])
+            self._write(state, step_token, current_target, write_mask)
+        state["age"] = torch.where(valid, state["age"] + 1, state["age"])
+        return enhanced, state, gate.mean(), entropy
+
+    def _read(self, query: torch.Tensor, state: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        keys = state["keys"]
+        vals = state["vals"]
+        valid = state["valid"]
+        query_key = F.normalize(self.key_proj(query), dim=-1)
+        memory_key = F.normalize(keys, dim=-1)
+        scores = torch.einsum("bd,bsd->bs", query_key, memory_key)
+        scores = scores.masked_fill(~valid, -1.0e9)
+        k = min(self.topk, self.memory_slots)
+        top_scores, top_idx = torch.topk(scores, k=k, dim=-1)
+        attn = torch.softmax(top_scores, dim=-1)
+        gathered = vals.gather(-2, top_idx.unsqueeze(-1).expand(-1, -1, vals.shape[-1]))
+        retrieved = (gathered * attn.unsqueeze(-1)).sum(dim=-2)
+        any_valid = valid.any(dim=-1, keepdim=True)
+        retrieved = torch.where(any_valid, retrieved, torch.zeros_like(retrieved))
+        entropy = -(attn * attn.clamp_min(1e-8).log()).sum(dim=-1)
+        entropy = torch.where(any_valid.squeeze(-1), entropy, torch.zeros_like(entropy))
+        return retrieved, entropy.mean()
+
+    def _write(
+        self,
+        state: dict[str, torch.Tensor],
+        query: torch.Tensor,
+        cue_target: torch.Tensor,
+        write_mask: torch.Tensor,
+    ) -> None:
+        rows = torch.nonzero(write_mask, as_tuple=False).squeeze(-1)
+        if rows.numel() == 0:
+            return
+        ptr = state["ptr"][rows]
+        key = F.normalize(self.key_proj(query.detach()), dim=-1)
+        value = self.value_emb(cue_target.clamp(min=0, max=CUE_CLASS_COUNT - 1))
+        state["keys"][rows, ptr] = key[rows].to(dtype=state["keys"].dtype)
+        state["vals"][rows, ptr] = value[rows].to(dtype=state["vals"].dtype)
+        state["valid"][rows, ptr] = True
+        state["ptr"][rows] = (ptr + 1) % self.memory_slots
+
+
 class TokenEncoder(nn.Module):
     """Build trajectory tokens from MiniGrid frame, direction, and side inputs."""
 
@@ -247,10 +452,23 @@ class TokenEncoder(nn.Module):
         dropout: float = 0.0,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
     ):
         super().__init__()
         self.slot_count = max(0, int(slot_count))
-        self.tokens_per_step = self.slot_count + 1
+        if temporal_token_mode not in {"flatten", "fuse"}:
+            raise ValueError("temporal_token_mode must be one of: flatten, fuse.")
+        if memory_kind not in {"none", "episodic_cue"}:
+            raise ValueError("memory_kind must be one of: none, episodic_cue.")
+        self.temporal_token_mode = temporal_token_mode
+        self.tokens_per_step = self.slot_count + 1 if temporal_token_mode == "flatten" else 1
         self.obs_encoder = MiniGridSpatialEncoder(
             d_model=d_model,
             spatial_layers=spatial_layers,
@@ -258,11 +476,31 @@ class TokenEncoder(nn.Module):
             dropout=dropout,
             encoder_type=spatial_encoder,
             slot_count=self.slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
         )
         self.action_proj = layer_init(nn.Linear(action_dim, d_model))
         self.reward_proj = layer_init(nn.Linear(1, d_model))
         self.start_proj = layer_init(nn.Linear(1, d_model))
         self.token_norm = nn.LayerNorm(d_model)
+        if self.slot_count > 0 and temporal_token_mode == "fuse":
+            fuse_heads = spatial_heads if d_model % max(1, spatial_heads) == 0 else 1
+            self.slot_fuse = nn.MultiheadAttention(d_model, fuse_heads, dropout=dropout, batch_first=True)
+            self.slot_fuse_norm = nn.LayerNorm(d_model)
+        else:
+            self.slot_fuse = None
+            self.slot_fuse_norm = None
+        self.memory = (
+            EpisodicCueMemory(
+                d_model=d_model,
+                memory_slots=memory_slots,
+                topk=memory_topk,
+                write_window=memory_write_window,
+            )
+            if memory_kind == "episodic_cue"
+            else None
+        )
 
     def forward(
         self,
@@ -280,13 +518,17 @@ class TokenEncoder(nn.Module):
             + self.reward_proj(prev_reward_seq.float())
             + self.start_proj(episode_start_seq.float())
         )
-        if slots is None:
-            x = spatial + side
+        global_token = spatial + side
+        if slots is None or self.temporal_token_mode == "fuse":
+            x = global_token if slots is None else self._fuse_step_slots(global_token, slots + side.unsqueeze(-2))
             token_valid_mask = valid_mask
         else:
             slot_tokens = slots + side.unsqueeze(-2)
-            global_token = (spatial + side).unsqueeze(-2)
-            x = torch.cat([slot_tokens, global_token], dim=-2)
+            x = torch.cat([slot_tokens, global_token.unsqueeze(-2)], dim=-2)
+            x = self.token_norm(x)
+            if self.memory is not None:
+                enhanced_global = self.memory(x[:, :, self.slot_count], obs_seq, episode_start_seq, valid_mask)
+                x = torch.cat([x[:, :, : self.slot_count], enhanced_global.unsqueeze(-2)], dim=-2)
             batch, seq_len, tokens_per_step, d_model = x.shape
             x = x.reshape(batch, seq_len * tokens_per_step, d_model)
             token_valid_mask = None
@@ -297,11 +539,80 @@ class TokenEncoder(nn.Module):
                     .expand(-1, -1, tokens_per_step)
                     .reshape(batch, seq_len * tokens_per_step)
                 )
+            x = _apply_valid_mask(x, token_valid_mask)
+            if return_valid_mask:
+                return x, token_valid_mask
+            return x
         x = self.token_norm(x)
+        if self.memory is not None:
+            x = self.memory(x, obs_seq, episode_start_seq, valid_mask)
         x = _apply_valid_mask(x, token_valid_mask)
         if return_valid_mask:
             return x, token_valid_mask
         return x
+
+    def _fuse_step_slots(self, global_token: torch.Tensor, slot_tokens: torch.Tensor) -> torch.Tensor:
+        if self.slot_fuse is None or self.slot_fuse_norm is None:
+            return global_token
+        batch, seq_len, slot_count, d_model = slot_tokens.shape
+        q = global_token.reshape(batch * seq_len, 1, d_model)
+        kv = slot_tokens.reshape(batch * seq_len, slot_count, d_model)
+        fused, _ = self.slot_fuse(q, kv, kv, need_weights=False)
+        fused = self.slot_fuse_norm(q + fused)
+        return fused.reshape(batch, seq_len, d_model)
+
+    def init_memory_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor] | None:
+        if self.memory is None:
+            return None
+        return self.memory.init_state(batch_size, device=device, dtype=dtype)
+
+    def reset_memory_state(self, state: dict[str, torch.Tensor] | None, done_mask: torch.Tensor) -> None:
+        if self.memory is not None:
+            self.memory.reset_state(state, done_mask)
+
+    def forward_step(
+        self,
+        obs: torch.Tensor,
+        direction: torch.Tensor,
+        prev_action: torch.Tensor,
+        prev_reward: torch.Tensor,
+        episode_start: torch.Tensor,
+        memory_state: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        spatial, slots = self.obs_encoder.forward_tokens(obs.unsqueeze(1), direction.unsqueeze(1))
+        side = (
+            self.action_proj(prev_action.unsqueeze(1).float())
+            + self.reward_proj(prev_reward.unsqueeze(1).float())
+            + self.start_proj(episode_start.unsqueeze(1).float())
+        )
+        global_token = spatial + side
+        if slots is None or self.temporal_token_mode == "fuse":
+            x = global_token if slots is None else self._fuse_step_slots(global_token, slots + side.unsqueeze(-2))
+            x = self.token_norm(x).squeeze(1)
+            if self.memory is not None:
+                cue_target = extract_cue_targets_torch(obs)
+                x, memory_state, _, _ = self.memory.forward_step(x, cue_target, episode_start, memory_state)
+            return x.unsqueeze(1), memory_state
+
+        slot_tokens = slots + side.unsqueeze(-2)
+        x = torch.cat([slot_tokens, global_token.unsqueeze(-2)], dim=-2)
+        x = self.token_norm(x).squeeze(1)
+        if self.memory is not None:
+            cue_target = extract_cue_targets_torch(obs)
+            enhanced_global, memory_state, _, _ = self.memory.forward_step(
+                x[:, self.slot_count],
+                cue_target,
+                episode_start,
+                memory_state,
+            )
+            x = torch.cat([x[:, : self.slot_count], enhanced_global.unsqueeze(1)], dim=1)
+        return x, memory_state
 
     def decision_tokens(self, x: torch.Tensor, time_steps: int) -> torch.Tensor:
         if self.tokens_per_step == 1:
@@ -450,6 +761,25 @@ class GatedAttentionBlock(nn.Module):
         return x, (cache_k, cache_v, lengths)
     
 
+def _init_cue_head(module: nn.Module, d_model: int, aux_recall: bool) -> None:
+    module.cue_head = layer_init(nn.Linear(d_model, CUE_CLASS_COUNT), std=0.01) if aux_recall else None
+
+
+def _actor_critic_output(
+    module: nn.Module,
+    features: torch.Tensor,
+    *,
+    return_aux: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    logits = _mask_logits(module, module.actor(features))
+    values = module.critic(features).squeeze(-1)
+    if return_aux:
+        cue_head = getattr(module, "cue_head", None)
+        aux_logits = cue_head(features) if cue_head is not None else None
+        return logits, values, aux_logits
+    return logits, values
+
+
 class MLPActorCritic(nn.Module):
     """Feedforward PPO baseline with spatial attention but no temporal memory."""
 
@@ -463,6 +793,7 @@ class MLPActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        aux_recall: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -486,6 +817,7 @@ class MLPActorCritic(nn.Module):
         )
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
 
     def forward(
         self,
@@ -494,7 +826,8 @@ class MLPActorCritic(nn.Module):
         prev_action: torch.Tensor,
         prev_reward: torch.Tensor,
         episode_start: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = (
             self.encoder(obs, direction)
             + self.action_proj(prev_action.float())
@@ -502,7 +835,7 @@ class MLPActorCritic(nn.Module):
             + self.start_proj(episode_start.float())
         )
         x = self.shared(x)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def get_action_and_value(
         self,
@@ -534,6 +867,15 @@ class LSTMActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
+        aux_recall: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -546,6 +888,14 @@ class LSTMActorCritic(nn.Module):
             dropout=dropout,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
+            temporal_token_mode=temporal_token_mode,
+            memory_kind=memory_kind,
+            memory_slots=memory_slots,
+            memory_topk=memory_topk,
+            memory_write_window=memory_write_window,
         )
         self.lstm = nn.LSTM(
             input_size=d_model,
@@ -556,6 +906,7 @@ class LSTMActorCritic(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
 
     def forward(
         self,
@@ -566,7 +917,8 @@ class LSTMActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         time_steps = obs_seq.shape[1]
         x, token_valid_mask = self.token_encoder(
             obs_seq,
@@ -593,7 +945,7 @@ class LSTMActorCritic(nn.Module):
         x = self.norm(x)
         x = _apply_valid_mask(x, token_valid_mask)
         x = self.token_encoder.decision_tokens(x, time_steps)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def get_action_and_value(
         self,
@@ -637,6 +989,15 @@ class GRUActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
+        aux_recall: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -649,6 +1010,14 @@ class GRUActorCritic(nn.Module):
             dropout=dropout,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
+            temporal_token_mode=temporal_token_mode,
+            memory_kind=memory_kind,
+            memory_slots=memory_slots,
+            memory_topk=memory_topk,
+            memory_write_window=memory_write_window,
         )
         self.gru = nn.GRU(
             input_size=d_model,
@@ -659,6 +1028,7 @@ class GRUActorCritic(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
 
     def forward(
         self,
@@ -669,7 +1039,8 @@ class GRUActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         time_steps = obs_seq.shape[1]
         x, token_valid_mask = self.token_encoder(
             obs_seq,
@@ -696,7 +1067,7 @@ class GRUActorCritic(nn.Module):
         x = self.norm(x)
         x = _apply_valid_mask(x, token_valid_mask)
         x = self.token_encoder.decision_tokens(x, time_steps)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def get_action_and_value(
         self,
@@ -748,6 +1119,15 @@ class MambaActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
+        aux_recall: bool = False,
     ):
         super().__init__()
         block_cls = _resolve_mamba_block(variant)
@@ -770,6 +1150,14 @@ class MambaActorCritic(nn.Module):
             dropout=dropout,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
+            temporal_token_mode=temporal_token_mode,
+            memory_kind=memory_kind,
+            memory_slots=memory_slots,
+            memory_topk=memory_topk,
+            memory_write_window=memory_write_window,
         )
         self.blocks = nn.ModuleList(
             [
@@ -794,6 +1182,7 @@ class MambaActorCritic(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
 
         #增加mamba梯度稳定性：在每个block输出后添加残差连接和LayerNorm，并在输出前对block输出进行clamp，防止数值过大导致NaN。
 
@@ -806,7 +1195,8 @@ class MambaActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         time_steps = obs_seq.shape[1]
         x, token_valid_mask = self.token_encoder(
             obs_seq,
@@ -824,7 +1214,7 @@ class MambaActorCritic(nn.Module):
         x = self.norm(x)
         x = _apply_valid_mask(x, token_valid_mask)
         x = self.token_encoder.decision_tokens(x, time_steps)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def init_inference_state(
         self,
@@ -832,7 +1222,7 @@ class MambaActorCritic(nn.Module):
         *,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> list[tuple[torch.Tensor, ...]]:
+    ) -> list[tuple[torch.Tensor, ...]] | dict[str, object]:
         """Allocate Mamba recurrent caches for one-token rollout inference."""
 
         states: list[tuple[torch.Tensor, ...]] = []
@@ -842,18 +1232,30 @@ class MambaActorCritic(nn.Module):
             cache = block.allocate_inference_cache(batch_size, 1, dtype=dtype)
             cache = tuple(t.to(device=device) if device is not None else t for t in cache)
             states.append(cache)
+        memory_state = self.token_encoder.init_memory_state(
+            batch_size,
+            device=device or next(self.parameters()).device,
+            dtype=dtype or next(self.parameters()).dtype,
+        )
+        if memory_state is not None:
+            return {"blocks": states, "memory": memory_state}
         return states
 
-    @staticmethod
     def reset_inference_state(
+        self,
         inference_state: list[tuple[torch.Tensor, ...]] | None,
         done_mask: torch.Tensor,
     ) -> None:
         if inference_state is None or done_mask.numel() == 0 or not done_mask.any():
             return
+        memory_state = None
+        if isinstance(inference_state, dict):
+            memory_state = inference_state.get("memory")
+            inference_state = inference_state["blocks"]
         for cache in inference_state:
             for tensor in cache:
                 tensor[done_mask] = 0
+        self.token_encoder.reset_memory_state(memory_state, done_mask)
 
     def get_action_and_value_step(
         self,
@@ -862,17 +1264,22 @@ class MambaActorCritic(nn.Module):
         prev_action: torch.Tensor,
         prev_reward: torch.Tensor,
         episode_start: torch.Tensor,
-        inference_state: list[tuple[torch.Tensor, ...]],
+        inference_state: list[tuple[torch.Tensor, ...]] | dict[str, object],
         action: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, ...]]]:
-        x_tokens = self.token_encoder(
-            obs.unsqueeze(1),
-            direction.unsqueeze(1),
-            prev_action.unsqueeze(1),
-            prev_reward.unsqueeze(1),
-            episode_start.unsqueeze(1),
-        )
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, ...]] | dict[str, object]]:
+        memory_state = None
         current_state = inference_state
+        if isinstance(inference_state, dict):
+            memory_state = inference_state.get("memory")
+            current_state = inference_state["blocks"]
+        x_tokens, memory_state = self.token_encoder.forward_step(
+            obs,
+            direction,
+            prev_action,
+            prev_reward,
+            episode_start,
+            memory_state,
+        )
         x = x_tokens[:, -1:]
         for token_idx in range(x_tokens.shape[1]):
             x = x_tokens[:, token_idx : token_idx + 1]
@@ -892,7 +1299,8 @@ class MambaActorCritic(nn.Module):
         dist = _safe_categorical(logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value, current_state
+        packed_state = {"blocks": current_state, "memory": memory_state} if memory_state is not None else current_state
+        return action, dist.log_prob(action), dist.entropy(), value, packed_state
 
     def get_action_and_value(
         self,
@@ -938,6 +1346,15 @@ class FastGatedAttentionActorCritic(nn.Module):
         spatial_encoder: str = "hybrid",
         position_mode: str = "learned",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
+        aux_recall: bool = False,
     ):
         super().__init__()
         if position_mode not in {"learned", "none", "alibi"}:
@@ -952,6 +1369,14 @@ class FastGatedAttentionActorCritic(nn.Module):
             action_dim=action_dim, d_model=d_model, spatial_layers=spatial_layers,
             spatial_heads=spatial_heads, dropout=dropout, spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
+            temporal_token_mode=temporal_token_mode,
+            memory_kind=memory_kind,
+            memory_slots=memory_slots,
+            memory_topk=memory_topk,
+            memory_write_window=memory_write_window,
         )
         self.time_context_len = context_len
         self.context_len = context_len * self.token_encoder.tokens_per_step
@@ -975,6 +1400,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
 
     def forward(
         self,
@@ -985,7 +1411,8 @@ class FastGatedAttentionActorCritic(nn.Module):
         episode_start_seq,
         valid_mask: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         
         time_steps = obs_seq.shape[1]
         x, token_valid_mask = self.token_encoder(
@@ -1013,7 +1440,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         x = self.norm(x)
         x = _apply_valid_mask(x, token_valid_mask)
         x = self.token_encoder.decision_tokens(x, time_steps)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def get_action_and_value(
         self,
@@ -1048,7 +1475,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         *,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | dict[str, object]:
         if self.position_mode == "learned":
             raise RuntimeError("Stateful Gated Attention rollout requires --gated-attention-pos none or alibi.")
         param = next(self.parameters())
@@ -1067,19 +1494,27 @@ class FastGatedAttentionActorCritic(nn.Module):
             cache_v = torch.zeros_like(cache_k)
             lengths = torch.zeros(batch_size, device=device, dtype=torch.long)
             states.append((cache_k, cache_v, lengths))
+        memory_state = self.token_encoder.init_memory_state(batch_size, device=device, dtype=dtype)
+        if memory_state is not None:
+            return {"blocks": states, "memory": memory_state}
         return states
 
-    @staticmethod
     def reset_inference_state(
+        self,
         inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None,
         done_mask: torch.Tensor,
     ) -> None:
         if inference_state is None or done_mask.numel() == 0 or not done_mask.any():
             return
+        memory_state = None
+        if isinstance(inference_state, dict):
+            memory_state = inference_state.get("memory")
+            inference_state = inference_state["blocks"]
         for cache_k, cache_v, lengths in inference_state:
             cache_k[done_mask] = 0
             cache_v[done_mask] = 0
             lengths[done_mask] = 0
+        self.token_encoder.reset_memory_state(memory_state, done_mask)
 
     def get_action_and_value_step(
         self,
@@ -1088,17 +1523,22 @@ class FastGatedAttentionActorCritic(nn.Module):
         prev_action: torch.Tensor,
         prev_reward: torch.Tensor,
         episode_start: torch.Tensor,
-        inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | dict[str, object],
         action: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-        x_tokens = self.token_encoder(
-            obs.unsqueeze(1),
-            direction.unsqueeze(1),
-            prev_action.unsqueeze(1),
-            prev_reward.unsqueeze(1),
-            episode_start.unsqueeze(1),
-        )
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | dict[str, object]]:
+        memory_state = None
         current_state = inference_state
+        if isinstance(inference_state, dict):
+            memory_state = inference_state.get("memory")
+            current_state = inference_state["blocks"]
+        x_tokens, memory_state = self.token_encoder.forward_step(
+            obs,
+            direction,
+            prev_action,
+            prev_reward,
+            episode_start,
+            memory_state,
+        )
         x = x_tokens[:, -1:]
         for token_idx in range(x_tokens.shape[1]):
             x = x_tokens[:, token_idx : token_idx + 1]
@@ -1114,7 +1554,8 @@ class FastGatedAttentionActorCritic(nn.Module):
         dist = _safe_categorical(logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value, current_state
+        packed_state = {"blocks": current_state, "memory": memory_state} if memory_state is not None else current_state
+        return action, dist.log_prob(action), dist.entropy(), value, packed_state
     
 class AttentionActorCritic(nn.Module):
     """Spatial-attention + causal temporal-attention actor critic."""
@@ -1132,6 +1573,15 @@ class AttentionActorCritic(nn.Module):
         valid_actions: list[int] | None = None,
         spatial_encoder: str = "hybrid",
         slot_count: int = 0,
+        slot_extractor: str = "query_pool",
+        slot_iters: int = 3,
+        slot_mlp_ratio: float = 2.0,
+        temporal_token_mode: str = "flatten",
+        memory_kind: str = "none",
+        memory_slots: int = 16,
+        memory_topk: int = 4,
+        memory_write_window: int = 12,
+        aux_recall: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -1145,6 +1595,14 @@ class AttentionActorCritic(nn.Module):
             dropout=dropout,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            slot_extractor=slot_extractor,
+            slot_iters=slot_iters,
+            slot_mlp_ratio=slot_mlp_ratio,
+            temporal_token_mode=temporal_token_mode,
+            memory_kind=memory_kind,
+            memory_slots=memory_slots,
+            memory_topk=memory_topk,
+            memory_write_window=memory_write_window,
         )
         self.time_context_len = context_len
         self.context_len = context_len * self.token_encoder.tokens_per_step
@@ -1162,6 +1620,7 @@ class AttentionActorCritic(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.actor = layer_init(nn.Linear(d_model, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
+        _init_cue_head(self, d_model, aux_recall)
         nn.init.trunc_normal_(self.temporal_pos, std=0.02)
 
     def forward(
@@ -1173,7 +1632,8 @@ class AttentionActorCritic(nn.Module):
         episode_start_seq: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         time_steps = obs_seq.shape[1]
         x, token_valid_mask = self.token_encoder(
             obs_seq,
@@ -1197,7 +1657,7 @@ class AttentionActorCritic(nn.Module):
         x = self.norm(x)
         x = _apply_valid_mask(x, token_valid_mask)
         x = self.token_encoder.decision_tokens(x, time_steps)
-        return _mask_logits(self, self.actor(x)), self.critic(x).squeeze(-1)
+        return _actor_critic_output(self, x, return_aux=return_aux)
 
     def get_action_and_value(
         self,
@@ -1239,6 +1699,17 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
     dropout = getattr(cfg, "dropout", 0.0)
     valid_actions = _parse_valid_actions(getattr(cfg, "valid_actions", None))
     slot_count = getattr(cfg, "slot_count", 0)
+    memory_kwargs = {
+        "slot_extractor": getattr(cfg, "slot_extractor", "query_pool"),
+        "slot_iters": getattr(cfg, "slot_iters", 3),
+        "slot_mlp_ratio": getattr(cfg, "slot_mlp_ratio", 2.0),
+        "temporal_token_mode": getattr(cfg, "temporal_token_mode", "flatten"),
+        "memory_kind": getattr(cfg, "memory_kind", "none"),
+        "memory_slots": getattr(cfg, "memory_slots", 16),
+        "memory_topk": getattr(cfg, "memory_topk", 4),
+        "memory_write_window": getattr(cfg, "memory_write_window", 12),
+        "aux_recall": getattr(cfg, "aux_recall_coef", 0.0) > 0,
+    }
 
     if model_name == "mlp":
         return MLPActorCritic(
@@ -1249,6 +1720,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             dropout=dropout,
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
+            aux_recall=memory_kwargs["aux_recall"],
         )
     if model_name == "lstm":
         return LSTMActorCritic(
@@ -1261,6 +1733,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            **memory_kwargs,
         )
     if model_name == "gru":
         return GRUActorCritic(
@@ -1273,6 +1746,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            **memory_kwargs,
         )
     if model_name == "mamba":
         return MambaActorCritic(
@@ -1293,6 +1767,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            **memory_kwargs,
         )
     if model_name == "attention":
         return AttentionActorCritic(
@@ -1307,6 +1782,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             valid_actions=valid_actions,
             spatial_encoder=spatial_encoder,
             slot_count=slot_count,
+            **memory_kwargs,
         )
     if model_name == "gated_attention":
         return FastGatedAttentionActorCritic(
@@ -1322,6 +1798,7 @@ def build_actor_critic(config: Any, action_dim: int) -> nn.Module:
             spatial_encoder=spatial_encoder,
             position_mode=getattr(cfg, "gated_attention_pos", "learned"),
             slot_count=slot_count,
+            **memory_kwargs,
         )
     
 

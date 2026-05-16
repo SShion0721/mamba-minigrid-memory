@@ -8,8 +8,10 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from src.cue import CUE_IGNORE_INDEX, extract_cue_targets_np
 from src.models import _safe_categorical
 
 
@@ -41,6 +43,8 @@ class RolloutBuffer:
         self.rewards = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.values = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.dones = np.zeros((num_steps, num_envs), dtype=bool)
+        self.cue_targets = np.full((num_steps, num_envs), CUE_IGNORE_INDEX, dtype=np.int64)
+        self.episode_cues = np.full(num_envs, CUE_IGNORE_INDEX, dtype=np.int64)
 
         self.advantages: np.ndarray | None = None
         self.returns: np.ndarray | None = None
@@ -66,11 +70,13 @@ class RolloutBuffer:
     def reset_context(self, env_idx: int) -> None:
         self.hist_pos[env_idx] = 0
         self.hist_len[env_idx] = 0
+        self.episode_cues[env_idx] = CUE_IGNORE_INDEX
 
     def reset_contexts(self, done_mask: np.ndarray) -> None:
         if done_mask.any():
             self.hist_pos[done_mask] = 0
             self.hist_len[done_mask] = 0
+            self.episode_cues[done_mask] = CUE_IGNORE_INDEX
 
     def reset_rollout(self) -> None:
         self.step = 0
@@ -102,6 +108,7 @@ class RolloutBuffer:
         self.rewards[idx, env_idx] = reward
         self.values[idx, env_idx] = value
         self.dones[idx, env_idx] = done
+        self._update_episode_cues(idx, np.asarray(obs)[None], np.asarray(episode_start)[None], np.asarray([env_idx]))
 
         pos = self.hist_pos[env_idx]
         self.hist_obs[env_idx, pos] = obs
@@ -140,6 +147,7 @@ class RolloutBuffer:
         self.rewards[idx] = rewards
         self.values[idx] = values
         self.dones[idx] = dones
+        self._update_episode_cues(idx, obs, episode_starts, self.env_indices)
 
         cols = self.hist_pos
         self.hist_obs[self.env_indices, cols] = obs
@@ -150,6 +158,24 @@ class RolloutBuffer:
         self.hist_pos = (self.hist_pos + 1) % self.context_len
         self.hist_len = np.minimum(self.hist_len + 1, self.context_len)
         self.reset_contexts(dones)
+
+    def _update_episode_cues(
+        self,
+        step_idx: int,
+        obs: np.ndarray,
+        episode_starts: np.ndarray,
+        env_indices: np.ndarray,
+    ) -> None:
+        starts = np.asarray(episode_starts).reshape(len(env_indices), -1)[:, 0] > 0.5
+        if starts.any():
+            self.episode_cues[env_indices[starts]] = CUE_IGNORE_INDEX
+        visible_cues = extract_cue_targets_np(obs)
+        missing = self.episode_cues[env_indices] == CUE_IGNORE_INDEX
+        has_visible = visible_cues != CUE_IGNORE_INDEX
+        write = missing & has_visible
+        if write.any():
+            self.episode_cues[env_indices[write]] = visible_cues[write]
+        self.cue_targets[step_idx, env_indices] = self.episode_cues[env_indices]
 
     def get_context(
         self,
@@ -258,6 +284,7 @@ class PPOTrainer:
         clip_vloss: bool = True,
         norm_adv: bool = True,
         amp_dtype: torch.dtype | None = None,
+        aux_recall_coef: float = 0.0,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -271,6 +298,7 @@ class PPOTrainer:
         self.clip_vloss = clip_vloss
         self.norm_adv = norm_adv
         self.amp_dtype = amp_dtype if device.type == "cuda" else None
+        self.aux_recall_coef = float(aux_recall_coef)
         self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.amp_dtype == torch.float16)
         self.global_step = 0
 
@@ -404,10 +432,11 @@ class PPOTrainer:
                     valid_mask,
                     loss_mask,
                     lengths,
+                    cue_target_seq,
                 ) = _pack_sequence_batch(buffer, selected, advantages, chunk_len, burn_in_len)
 
                 with self._autocast():
-                    logits, new_values = self.model.forward(
+                    model_out = self.model.forward(
                         torch.as_tensor(obs_seq, device=self.device),
                         torch.as_tensor(dir_seq, device=self.device),
                         torch.as_tensor(prev_act_seq, device=self.device),
@@ -415,7 +444,13 @@ class PPOTrainer:
                         torch.as_tensor(ep_start_seq, device=self.device),
                         valid_mask=torch.as_tensor(valid_mask, device=self.device),
                         lengths=torch.as_tensor(lengths, device=self.device),
+                        return_aux=self.aux_recall_coef > 0,
                     )
+                    if self.aux_recall_coef > 0 and len(model_out) == 3:
+                        logits, new_values, aux_logits = model_out
+                    else:
+                        logits, new_values = model_out[:2]
+                        aux_logits = None
                     dist = _safe_categorical(logits)
                     new_logprob = dist.log_prob(torch.as_tensor(action_seq, device=self.device).long())
                     entropy = dist.entropy()
@@ -429,6 +464,8 @@ class PPOTrainer:
                     returns=torch.as_tensor(ret_seq, device=self.device),
                     old_values=torch.as_tensor(old_value_seq, device=self.device),
                     loss_mask=torch.as_tensor(loss_mask, device=self.device),
+                    aux_logits=aux_logits,
+                    cue_targets=torch.as_tensor(cue_target_seq, device=self.device).long(),
                 )
                 batch_counter += 1
                 if progress_callback is not None:
@@ -447,6 +484,8 @@ class PPOTrainer:
         returns: torch.Tensor,
         old_values: torch.Tensor,
         loss_mask: torch.Tensor | None = None,
+        aux_logits: torch.Tensor | None = None,
+        cue_targets: torch.Tensor | None = None,
     ) -> bool:
         if loss_mask is not None:
             loss_mask = loss_mask.float()
@@ -491,6 +530,18 @@ class PPOTrainer:
 
         entropy_loss = reduce_loss(entropy)
         loss = pg_loss - self.ent_coef * entropy_loss + self.vf_coef * value_loss
+        aux_loss = torch.zeros((), device=new_value.device)
+        aux_accuracy = torch.full((), float("nan"), device=new_value.device)
+        if self.aux_recall_coef > 0 and aux_logits is not None and cue_targets is not None:
+            cue_targets = cue_targets.to(device=aux_logits.device).long()
+            cue_keep = cue_targets != CUE_IGNORE_INDEX
+            if loss_mask is not None:
+                cue_keep = cue_keep & loss_mask.bool().to(device=aux_logits.device)
+            if cue_keep.any():
+                aux_loss = F.cross_entropy(aux_logits[cue_keep], cue_targets[cue_keep])
+                aux_pred = aux_logits[cue_keep].argmax(dim=-1)
+                aux_accuracy = (aux_pred == cue_targets[cue_keep]).float().mean()
+                loss = loss + self.aux_recall_coef * aux_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.grad_scaler.is_enabled():
@@ -511,6 +562,9 @@ class PPOTrainer:
         self.writer.add_scalar("loss/value", value_loss.item(), self.global_step)
         self.writer.add_scalar("loss/entropy", entropy_loss.item(), self.global_step)
         self.writer.add_scalar("loss/total", loss.item(), self.global_step)
+        self.writer.add_scalar("loss/aux_recall", aux_loss.item(), self.global_step)
+        if bool(torch.isfinite(aux_accuracy).item()):
+            self.writer.add_scalar("loss/aux_recall_acc", aux_accuracy.item(), self.global_step)
         self.writer.add_scalar("loss/old_approx_kl", old_approx_kl.item(), self.global_step)
         self.writer.add_scalar("loss/approx_kl", approx_kl.item(), self.global_step)
         self.writer.add_scalar("loss/clipfrac", clipfrac.item(), self.global_step)
@@ -593,6 +647,7 @@ def _pack_sequence_batch(
     adv_seq = np.zeros((batch_size, sequence_len), dtype=advantages.dtype)
     ret_seq = np.zeros((batch_size, sequence_len), dtype=buffer.returns.dtype)
     old_value_seq = np.zeros((batch_size, sequence_len), dtype=buffer.values.dtype)
+    cue_target_seq = np.full((batch_size, sequence_len), CUE_IGNORE_INDEX, dtype=np.int64)
     valid_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
     loss_mask = np.zeros((batch_size, sequence_len), dtype=np.float32)
     lengths = np.zeros(batch_size, dtype=np.int64)
@@ -618,6 +673,7 @@ def _pack_sequence_batch(
         adv_seq[batch_idx, dest] = advantages[src, env_idx]
         ret_seq[batch_idx, dest] = buffer.returns[src, env_idx]
         old_value_seq[batch_idx, dest] = buffer.values[src, env_idx]
+        cue_target_seq[batch_idx, dest] = buffer.cue_targets[src, env_idx]
         valid_mask[batch_idx, dest] = 1.0
         lengths[batch_idx] = sequence_length
         loss_start = offset + target_start
@@ -637,4 +693,5 @@ def _pack_sequence_batch(
         valid_mask,
         loss_mask,
         lengths,
+        cue_target_seq,
     )
