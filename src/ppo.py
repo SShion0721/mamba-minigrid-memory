@@ -281,7 +281,7 @@ class PPOTrainer:
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         target_kl: float | None = None,
-        clip_vloss: bool = True,
+        clip_vloss: bool = False,
         norm_adv: bool = True,
         amp_dtype: torch.dtype | None = None,
         aux_recall_coef: float = 0.0,

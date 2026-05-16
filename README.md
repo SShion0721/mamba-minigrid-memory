@@ -323,7 +323,8 @@ LSTM 只作为 baseline，默认 `--lstm-layers 1`。如果 LSTM 明显欠拟合
 | `--lr` | GRU/Gated `2.5e-4`，Mamba3 `1e-4` | collapse、KL 飙升、success 回落就降一档 |
 | `--gamma` | `0.99` | MiniGrid Memory 先不动 |
 | `--gae-lambda` | `0.95` | 方差大可试 `0.90`，通常不需要 |
-| `--clip-coef` | `0.2` | PPO 默认稳妥值 |
+| `--clip-coef` | `0.2` | policy ratio clipping 默认稳妥值 |
+| `--clip-vloss` | 默认关闭 | 只在 value loss 抖动很大时做 PPO2-style 兼容实验 |
 | `--vf-coef` | `0.5` | value loss 明显压 policy 再降到 `0.25` |
 | `--ent-coef` | `0.01` | 探索不足升到 `0.02`；策略长期随机降到 `0.005` |
 | `--ent-coef-final` | `0.001` | 后期 greedy 不稳可降到 `0.0005` |
@@ -338,11 +339,10 @@ LSTM 只作为 baseline，默认 `--lstm-layers 1`。如果 LSTM 明显欠拟合
 ```text
 learning-rate annealing
 advantage normalization
-value loss clipping
 stateful rollout
 ```
 
-对应的关闭开关分别是 `--no-anneal-lr`、`--no-norm-adv`、`--no-clip-vloss`、`--no-stateful-rollout`。它们只适合做诊断，不建议放进主结果。
+对应的关闭开关分别是 `--no-anneal-lr`、`--no-norm-adv`、`--no-stateful-rollout`。`clip_vloss` 默认关闭；需要复现 PPO2 / CleanRL 风格时显式加 `--clip-vloss`。
 
 ### 运行与工程参数
 

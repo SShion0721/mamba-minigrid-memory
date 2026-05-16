@@ -54,7 +54,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    clip_vloss: bool = True
+    clip_vloss: bool = False
     norm_adv: bool = True
     ent_coef: float = 0.01
     vf_coef: float = 0.5
@@ -1168,8 +1168,9 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
-    parser.add_argument("--no-clip-vloss", dest="clip_vloss", action="store_false")
-    parser.set_defaults(clip_vloss=True)
+    parser.add_argument("--clip-vloss", dest="clip_vloss", action="store_true", help="Enable PPO2-style value loss clipping.")
+    parser.add_argument("--no-clip-vloss", dest="clip_vloss", action="store_false", help="Keep value loss unclipped; this is the default.")
+    parser.set_defaults(clip_vloss=False)
     parser.add_argument("--no-norm-adv", dest="norm_adv", action="store_false")
     parser.set_defaults(norm_adv=True)
     parser.add_argument("--ent-coef", type=float, default=0.01)
