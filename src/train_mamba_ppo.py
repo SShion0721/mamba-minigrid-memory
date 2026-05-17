@@ -591,6 +591,7 @@ def train(config: Config) -> None:
                     model,
                     device,
                     config,
+                    amp_dtype=amp_dtype,
                     progress_callback=_eval_progress,
                 )
                 writer.add_scalar("eval/success_rate", success_rate, global_step)
@@ -689,6 +690,7 @@ def evaluate(
     model,
     device: torch.device,
     config: Config,
+    amp_dtype: torch.dtype | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[float, float, float]:
     """Evaluate with greedy actions."""
@@ -697,6 +699,12 @@ def evaluate(
     successes = 0
     total_return = 0.0
     total_length = 0
+    use_stateful_eval = _stateful_eval_enabled(model, config)
+    if use_stateful_eval:
+        try:
+            return _evaluate_stateful_batched(model, device, config, amp_dtype, progress_callback)
+        except Exception as exc:
+            print(f"Warning: stateful batched eval failed; falling back to full-context eval. Reason: {type(exc).__name__}: {exc}")
 
     for episode in range(config.eval_episodes):
         env = make_env(
@@ -742,9 +750,10 @@ def evaluate(
                     config.context_len,
                     action_dim,
                     greedy=True,
+                    amp_dtype=amp_dtype,
                 )
             else:
-                with torch.no_grad():
+                with torch.no_grad(), _autocast_context(device, amp_dtype):
                     logits, _ = model.forward(
                         torch.as_tensor(obs, device=device).unsqueeze(0),
                         torch.as_tensor(direction, device=device).unsqueeze(0),
@@ -779,6 +788,113 @@ def evaluate(
         total_return / config.eval_episodes,
         total_length / config.eval_episodes,
     )
+
+
+def _evaluate_stateful_batched(
+    model,
+    device: torch.device,
+    config: Config,
+    amp_dtype: torch.dtype | None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[float, float, float]:
+    envs = [
+        make_env(
+            config.env_id,
+            seed=config.seed + 10_000 + episode,
+            spinning_penalty=config.spinning_penalty,
+            spinning_threshold=config.spinning_threshold,
+        )
+        for episode in range(config.eval_episodes)
+    ]
+
+    first_obs, _ = envs[0].reset(seed=config.seed + 10_000)
+    obs_shape = first_obs["obs"].shape
+    action_dim = envs[0].action_space.n
+    obs_buf = np.zeros((config.eval_episodes, *obs_shape), dtype=np.uint8)
+    direction_buf = np.zeros((config.eval_episodes, 1), dtype=np.int64)
+    prev_action_buf = np.zeros((config.eval_episodes, action_dim), dtype=np.float32)
+    prev_reward_buf = np.zeros((config.eval_episodes, 1), dtype=np.float32)
+    episode_start_buf = np.ones((config.eval_episodes, 1), dtype=np.float32)
+
+    obs_buf[0] = first_obs["obs"]
+    direction_buf[0] = first_obs["direction"]
+    prev_action_buf[0] = first_obs["prev_action"]
+    prev_reward_buf[0] = first_obs["prev_reward"]
+    episode_start_buf[0] = first_obs["episode_start"]
+    for episode in range(1, config.eval_episodes):
+        obs_dict, _ = envs[episode].reset(seed=config.seed + 10_000 + episode)
+        obs_buf[episode] = obs_dict["obs"]
+        direction_buf[episode] = obs_dict["direction"]
+        prev_action_buf[episode] = obs_dict["prev_action"]
+        prev_reward_buf[episode] = obs_dict["prev_reward"]
+        episode_start_buf[episode] = obs_dict["episode_start"]
+
+    inference_state = model.init_inference_state(
+        config.eval_episodes,
+        device=device,
+        dtype=amp_dtype or _model_parameter_dtype(model),
+    )
+    done_mask = np.zeros(config.eval_episodes, dtype=bool)
+    episode_returns = np.zeros(config.eval_episodes, dtype=np.float32)
+    episode_lengths = np.zeros(config.eval_episodes, dtype=np.int32)
+    last_rewards = np.zeros(config.eval_episodes, dtype=np.float32)
+    completed = 0
+
+    try:
+        while completed < config.eval_episodes:
+            with torch.no_grad(), _autocast_context(device, amp_dtype):
+                action, _, _, _, inference_state = model.get_action_and_value_step(
+                    torch.as_tensor(obs_buf, device=device),
+                    torch.as_tensor(direction_buf, device=device),
+                    torch.as_tensor(prev_action_buf, device=device),
+                    torch.as_tensor(prev_reward_buf, device=device),
+                    torch.as_tensor(episode_start_buf, device=device),
+                    inference_state,
+                    deterministic=True,
+                )
+            action_np = action.cpu().numpy().astype(np.int64, copy=False)
+
+            for episode, env in enumerate(envs):
+                if done_mask[episode]:
+                    continue
+                obs_dict, reward, terminated, truncated, _ = env.step(int(action_np[episode]))
+                done = terminated or truncated
+                episode_returns[episode] += float(reward)
+                episode_lengths[episode] += 1
+                last_rewards[episode] = float(reward)
+                if done:
+                    done_mask[episode] = True
+                    completed += 1
+                    if progress_callback is not None:
+                        progress_callback(completed, config.eval_episodes)
+                    continue
+
+                obs_buf[episode] = obs_dict["obs"]
+                direction_buf[episode] = obs_dict["direction"]
+                prev_action_buf[episode] = obs_dict["prev_action"]
+                prev_reward_buf[episode] = obs_dict["prev_reward"]
+                episode_start_buf[episode] = obs_dict["episode_start"]
+    finally:
+        for env in envs:
+            env.close()
+
+    return (
+        float(np.mean(last_rewards > 0.0)),
+        float(np.mean(episode_returns)),
+        float(np.mean(episode_lengths)),
+    )
+
+
+def _stateful_eval_enabled(model, config: Config) -> bool:
+    if not config.stateful_rollout:
+        return False
+    if config.model == "mamba" and config.mamba_variant == "mamba3":
+        return False
+    if config.model not in {"mamba", "gated_attention"}:
+        return False
+    if config.model == "gated_attention" and config.gated_attention_pos not in {"none", "alibi"}:
+        return False
+    return hasattr(model, "init_inference_state") and hasattr(model, "get_action_and_value_step")
 
 
 def _reset_env_buffers(
@@ -863,11 +979,12 @@ def _select_sequence_action(
     action_dim: int,
     *,
     greedy: bool,
+    amp_dtype: torch.dtype | None = None,
 ) -> int:
     obs_seq, dir_seq, act_seq, rew_seq, start_seq, valid_mask = _pack_context(
         obs_ctx, dir_ctx, act_ctx, rew_ctx, start_ctx, context_len, action_dim
     )
-    with torch.no_grad():
+    with torch.no_grad(), _autocast_context(device, amp_dtype):
         logits, _ = model.forward(
             torch.as_tensor(obs_seq, device=device),
             torch.as_tensor(dir_seq, device=device),

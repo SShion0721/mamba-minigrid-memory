@@ -19,6 +19,9 @@ slot-memory gated-attention PPO run.
   path instead of the heavier `nn.MultiheadAttention` wrapper call.
 - Bootstrap value computation now runs under the same AMP autocast setting as
   rollout and PPO updates.
+- Evaluation now uses batched stateful one-token rollout when the model supports
+  it (`gated_attention` with `none`/`alibi`, and cache-capable Mamba variants),
+  instead of recomputing a full context window and running episodes serially.
 - PPO update start lines are emitted before the first minibatch so long updates
   no longer look silent when the tqdm postfix is truncated.
 

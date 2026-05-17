@@ -1366,6 +1366,7 @@ class MambaActorCritic(nn.Module):
         episode_start: torch.Tensor,
         inference_state: list[tuple[torch.Tensor, ...]] | dict[str, object],
         action: torch.Tensor | None = None,
+        deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, ...]] | dict[str, object]]:
         memory_state = None
         current_state = inference_state
@@ -1398,7 +1399,7 @@ class MambaActorCritic(nn.Module):
         value = self.critic(x[:, -1]).squeeze(-1)
         dist = _safe_categorical(logits)
         if action is None:
-            action = dist.sample()
+            action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         packed_state = {"blocks": current_state, "memory": memory_state} if memory_state is not None else current_state
         return action, dist.log_prob(action), dist.entropy(), value, packed_state
 
@@ -1625,6 +1626,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         episode_start: torch.Tensor,
         inference_state: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | dict[str, object],
         action: torch.Tensor | None = None,
+        deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | dict[str, object]]:
         memory_state = None
         current_state = inference_state
@@ -1653,7 +1655,7 @@ class FastGatedAttentionActorCritic(nn.Module):
         value = self.critic(x[:, -1]).squeeze(-1)
         dist = _safe_categorical(logits)
         if action is None:
-            action = dist.sample()
+            action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         packed_state = {"blocks": current_state, "memory": memory_state} if memory_state is not None else current_state
         return action, dist.log_prob(action), dist.entropy(), value, packed_state
     
