@@ -372,9 +372,9 @@ class EpisodicCueMemory(nn.Module):
         )
         cue_targets = extract_cue_targets_torch(obs_seq)
         outputs = []
-        gate_stats = []
-        entropy_stats = []
-        write_stats = []
+        gate_sum = torch.zeros((), device=step_tokens.device)
+        entropy_sum = torch.zeros((), device=step_tokens.device)
+        write_sum = torch.zeros((), device=step_tokens.device)
         for idx in range(seq_len):
             valid = None if valid_mask is None else valid_mask[:, idx].to(device=step_tokens.device).bool()
             out, state, gate_mean, entropy, write_rate = self.forward_step(
@@ -385,13 +385,14 @@ class EpisodicCueMemory(nn.Module):
                 valid,
             )
             outputs.append(out)
-            gate_stats.append(gate_mean)
-            entropy_stats.append(entropy)
-            write_stats.append(write_rate)
-        if gate_stats and not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
-            self.last_gate_mean = float(torch.stack(gate_stats).mean().detach().cpu())
-            self.last_retrieval_entropy = float(torch.stack(entropy_stats).mean().detach().cpu())
-            self.last_write_rate = float(torch.stack(write_stats).mean().detach().cpu())
+            gate_sum = gate_sum + gate_mean
+            entropy_sum = entropy_sum + entropy
+            write_sum = write_sum + write_rate
+        if seq_len > 0 and not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
+            denom = float(seq_len)
+            self.last_gate_mean = float((gate_sum / denom).cpu())
+            self.last_retrieval_entropy = float((entropy_sum / denom).cpu())
+            self.last_write_rate = float((write_sum / denom).cpu())
         return torch.stack(outputs, dim=1)
 
     def forward_step(
@@ -429,11 +430,7 @@ class EpisodicCueMemory(nn.Module):
             state["episode_cue"] = torch.where(write_mask, current_target, state["episode_cue"])
             state = self._write(state, step_token, current_target, write_mask)
         state["age"] = torch.where(valid, state["age"] + 1, state["age"])
-        if not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
-            self.last_gate_mean = float(gate.mean().detach().cpu())
-            self.last_retrieval_entropy = float(entropy.detach().cpu())
-            self.last_write_rate = float(write_rate.detach().cpu())
-        return enhanced, state, gate.mean(), entropy, write_rate
+        return enhanced, state, gate.mean().detach(), entropy.detach(), write_rate.detach()
 
     def _read(self, query: torch.Tensor, state: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         keys = state["keys"]
@@ -598,11 +595,40 @@ class TokenEncoder(nn.Module):
         if self.slot_fuse is None or self.slot_fuse_norm is None:
             return global_token
         batch, seq_len, slot_count, d_model = slot_tokens.shape
-        q = global_token.reshape(batch * seq_len, 1, d_model)
-        kv = slot_tokens.reshape(batch * seq_len, slot_count, d_model)
-        fused, _ = self.slot_fuse(q, kv, kv, need_weights=False)
-        fused = self.slot_fuse_norm(q + fused)
+        query = global_token.reshape(batch * seq_len, 1, d_model)
+        key_value = slot_tokens.reshape(batch * seq_len, slot_count, d_model)
+        fused = self._single_query_slot_attention(query, key_value)
+        fused = self.slot_fuse_norm(query + fused)
         return fused.reshape(batch, seq_len, d_model)
+
+    def _single_query_slot_attention(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+        assert self.slot_fuse is not None
+        embed_dim = query.shape[-1]
+        num_heads = self.slot_fuse.num_heads
+        head_dim = embed_dim // num_heads
+        in_bias = self.slot_fuse.in_proj_bias
+        q = F.linear(
+            query,
+            self.slot_fuse.in_proj_weight[:embed_dim],
+            None if in_bias is None else in_bias[:embed_dim],
+        )
+        k = F.linear(
+            key_value,
+            self.slot_fuse.in_proj_weight[embed_dim : 2 * embed_dim],
+            None if in_bias is None else in_bias[embed_dim : 2 * embed_dim],
+        )
+        v = F.linear(
+            key_value,
+            self.slot_fuse.in_proj_weight[2 * embed_dim :],
+            None if in_bias is None else in_bias[2 * embed_dim :],
+        )
+        q = q.view(query.shape[0], 1, num_heads, head_dim).transpose(1, 2)
+        k = k.view(key_value.shape[0], key_value.shape[1], num_heads, head_dim).transpose(1, 2)
+        v = v.view(key_value.shape[0], key_value.shape[1], num_heads, head_dim).transpose(1, 2)
+        dropout_p = self.slot_fuse.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = out.transpose(1, 2).contiguous().view(query.shape[0], 1, embed_dim)
+        return self.slot_fuse.out_proj(out)
 
     def init_memory_state(
         self,
@@ -714,6 +740,10 @@ class GatedAttentionBlock(nn.Module):
         self.gate2 = GRUGate(d_model)
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self._alibi_cache_key = None
+        self._alibi_cache = None
+        self._causal_cache_key = None
+        self._causal_cache = None
 
     def forward(
         self,
@@ -735,12 +765,12 @@ class GatedAttentionBlock(nn.Module):
         # 调用 PyTorch 原生的高效 SDPA (底层自动使用 FlashAttention)
         attn_mask = None
         if alibi_slopes is not None:
-            attn_mask = _alibi_attention_mask(T, alibi_slopes, q.device, q.dtype, causal=is_causal)
+            attn_mask = self._cached_alibi_attention_mask(T, alibi_slopes, q.device, q.dtype, causal=is_causal)
             is_causal = False
         if valid_mask is not None:
             pad_bias = _padding_attention_bias(valid_mask, q.device, q.dtype)
             if attn_mask is None:
-                attn_mask = _causal_attention_bias(T, q.device, q.dtype) if is_causal else 0.0
+                attn_mask = self._cached_causal_attention_bias(T, q.device, q.dtype) if is_causal else 0.0
             attn_mask = attn_mask + pad_bias
             is_causal = False
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
@@ -753,8 +783,35 @@ class GatedAttentionBlock(nn.Module):
         # 2. MLP 层
         mlp_out = self.mlp(self.norm2(x))
         x = self.gate2(x, mlp_out)
-        
+
         return _apply_valid_mask(torch.nan_to_num(x), valid_mask)
+
+    def _cached_alibi_attention_mask(
+        self,
+        seq_len: int,
+        slopes: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        causal: bool,
+    ) -> torch.Tensor:
+        key = (seq_len, device.type, device.index, dtype, causal)
+        if self._alibi_cache_key != key or self._alibi_cache is None:
+            self._alibi_cache = _alibi_attention_mask(seq_len, slopes, device, dtype, causal=causal)
+            self._alibi_cache_key = key
+        return self._alibi_cache
+
+    def _cached_causal_attention_bias(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (seq_len, device.type, device.index, dtype)
+        if self._causal_cache_key != key or self._causal_cache is None:
+            self._causal_cache = _causal_attention_bias(seq_len, device, dtype)
+            self._causal_cache_key = key
+        return self._causal_cache
 
     def forward_step(
         self,

@@ -373,12 +373,14 @@ class PPOTrainer:
         chunk_len: int,
         batch_chunks: int,
         n_epochs: int,
+        dynamic_sequence_len: bool = False,
     ) -> None:
         self.train_sequence_with_callback(
             buffer,
             chunk_len=chunk_len,
             batch_chunks=batch_chunks,
             n_epochs=n_epochs,
+            dynamic_sequence_len=dynamic_sequence_len,
             progress_callback=None,
         )
 
@@ -388,6 +390,7 @@ class PPOTrainer:
         chunk_len: int,
         batch_chunks: int,
         n_epochs: int,
+        dynamic_sequence_len: bool = False,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         if buffer.advantages is None or buffer.returns is None:
@@ -433,7 +436,18 @@ class PPOTrainer:
                     loss_mask,
                     lengths,
                     cue_target_seq,
-                ) = _pack_sequence_batch(buffer, selected, advantages, chunk_len, burn_in_len)
+                ) = _pack_sequence_batch(
+                    buffer,
+                    selected,
+                    advantages,
+                    chunk_len,
+                    burn_in_len,
+                    fixed_sequence_len=not dynamic_sequence_len,
+                )
+
+                model_valid_mask = None if bool(valid_mask.all()) else valid_mask
+                model_lengths = None if model_valid_mask is None else lengths
+                update_loss_mask = None if bool(loss_mask.all()) else loss_mask
 
                 with self._autocast():
                     model_out = self.model.forward(
@@ -442,8 +456,16 @@ class PPOTrainer:
                         torch.as_tensor(prev_act_seq, device=self.device),
                         torch.as_tensor(prev_rew_seq, device=self.device),
                         torch.as_tensor(ep_start_seq, device=self.device),
-                        valid_mask=torch.as_tensor(valid_mask, device=self.device),
-                        lengths=torch.as_tensor(lengths, device=self.device),
+                        valid_mask=(
+                            None
+                            if model_valid_mask is None
+                            else torch.as_tensor(model_valid_mask, device=self.device)
+                        ),
+                        lengths=(
+                            None
+                            if model_lengths is None
+                            else torch.as_tensor(model_lengths, device=self.device)
+                        ),
                         return_aux=self.aux_recall_coef > 0,
                     )
                     if self.aux_recall_coef > 0 and len(model_out) == 3:
@@ -463,7 +485,11 @@ class PPOTrainer:
                     advantages=torch.as_tensor(adv_seq, device=self.device),
                     returns=torch.as_tensor(ret_seq, device=self.device),
                     old_values=torch.as_tensor(old_value_seq, device=self.device),
-                    loss_mask=torch.as_tensor(loss_mask, device=self.device),
+                    loss_mask=(
+                        None
+                        if update_loss_mask is None
+                        else torch.as_tensor(update_loss_mask, device=self.device)
+                    ),
                     aux_logits=aux_logits,
                     cue_targets=torch.as_tensor(cue_target_seq, device=self.device).long(),
                 )
@@ -632,10 +658,24 @@ def _pack_sequence_batch(
     advantages: np.ndarray,
     chunk_len: int,
     burn_in_len: int,
+    *,
+    fixed_sequence_len: bool = True,
 ) -> tuple[np.ndarray, ...]:
     batch_size = len(selected)
     obs_shape = buffer.observations.shape[2:]
-    sequence_len = chunk_len + burn_in_len
+    max_sequence_len = chunk_len + burn_in_len
+    if fixed_sequence_len:
+        sequence_len = max_sequence_len
+    else:
+        sequence_len = 1
+        for env_idx, segment_start, start, end in selected:
+            del env_idx
+            target_length = end - start
+            if target_length <= 0:
+                continue
+            burn_start = max(segment_start, start - burn_in_len)
+            sequence_len = max(sequence_len, end - burn_start)
+        sequence_len = min(sequence_len, max_sequence_len)
 
     obs_seq = np.zeros((batch_size, sequence_len, *obs_shape), dtype=buffer.observations.dtype)
     dir_seq = np.zeros((batch_size, sequence_len, 1), dtype=buffer.directions.dtype)

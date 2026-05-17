@@ -79,6 +79,31 @@ def test_pack_sequence_batch_left_aligns_valid_and_loss_masks():
     assert lengths[0] == 4
 
 
+def test_pack_sequence_batch_can_trim_padding_for_dynamic_updates():
+    buffer = RolloutBuffer(num_envs=1, num_steps=8, obs_shape=(1, 1, 3), action_dim=3, context_len=8)
+
+    for step in range(buffer.num_steps):
+        buffer.observations[step, 0, 0, 0, 0] = step + 1
+        buffer.episode_starts[step, 0, 0] = 1.0 if step == 0 else 0.0
+
+    advantages = np.arange(buffer.num_steps, dtype=np.float32).reshape(buffer.num_steps, 1)
+    buffer.returns = advantages
+
+    obs_seq, *_rest, valid_mask, loss_mask, lengths, _cue_target_seq = _pack_sequence_batch(
+        buffer,
+        [(0, 0, 2, 4), (0, 4, 4, 5)],
+        advantages,
+        chunk_len=4,
+        burn_in_len=4,
+        fixed_sequence_len=False,
+    )
+
+    assert obs_seq.shape[1] == 4
+    assert valid_mask.tolist() == [[1, 1, 1, 1], [1, 0, 0, 0]]
+    assert loss_mask.tolist() == [[0, 0, 1, 1], [1, 0, 0, 0]]
+    assert lengths.tolist() == [4, 1]
+
+
 def test_gated_attention_valid_mask_ignores_padding_tokens():
     for position_mode in ["learned", "alibi"]:
         torch.manual_seed(0)

@@ -266,6 +266,7 @@ def train(config: Config) -> None:
     initial_global_step = global_step
     next_eval = _next_interval_boundary(global_step, config.eval_interval)
     next_save = _next_interval_boundary(global_step, config.save_interval)
+    dynamic_sequence_len = _dynamic_sequence_len_enabled(config)
     mamba_stateful_supported = not (config.model == "mamba" and config.mamba_variant == "mamba3")
     use_stateful_rollout = (
         config.stateful_rollout
@@ -298,7 +299,8 @@ def train(config: Config) -> None:
         f"slots={config.slot_extractor}/{config.slot_count} token_mode={config.temporal_token_mode} "
         f"memory={config.memory_kind} aux={config.aux_recall_coef} "
         f"gated_pos={config.gated_attention_pos} "
-        f"amp={config.amp} compile={config.torch_compile} stateful={use_stateful_rollout}",
+        f"amp={config.amp} compile={config.torch_compile} stateful={use_stateful_rollout} "
+        f"dynamic_seq={dynamic_sequence_len}",
         flush=True,
     )
 
@@ -473,6 +475,7 @@ def train(config: Config) -> None:
                 prev_action_buf,
                 prev_reward_buf,
                 episode_start_buf,
+                amp_dtype,
             )
             buffer.compute_gae(next_value, gamma=config.gamma, gae_lambda=config.gae_lambda)
 
@@ -500,12 +503,20 @@ def train(config: Config) -> None:
                         recent_successes=recent_successes,
                     )
                 )
+            if update == 0 or (update + 1) % config.log_interval == 0:
+                tqdm.write(
+                    f"PPO update start {update + 1}/{num_updates} | "
+                    f"step {global_step}/{config.total_steps} | "
+                    f"chunk={config.chunk_len} batch_chunks={config.batch_chunks} "
+                    f"epochs={config.n_epochs} dynamic_seq={dynamic_sequence_len}"
+                )
             if config.model in SEQUENCE_MODELS:
                 trainer.train_sequence_with_callback(
                     buffer,
                     chunk_len=config.chunk_len,
                     batch_chunks=config.batch_chunks,
                     n_epochs=config.n_epochs,
+                    dynamic_sequence_len=dynamic_sequence_len,
                     progress_callback=_ppo_progress,
                 )
             else:
@@ -800,19 +811,24 @@ def _bootstrap_value(
     prev_action_buf: np.ndarray,
     prev_reward_buf: np.ndarray,
     episode_start_buf: np.ndarray,
+    amp_dtype: torch.dtype | None,
 ) -> np.ndarray:
-    with torch.no_grad():
+    with torch.no_grad(), _autocast_context(device, amp_dtype):
         if config.model in SEQUENCE_MODELS:
             context = buffer.get_context(obs_buf, direction_buf, prev_action_buf, prev_reward_buf, episode_start_buf)
+            valid_mask_np = context[5]
+            valid_mask_t = None if bool(valid_mask_np.all()) else torch.as_tensor(valid_mask_np, device=device)
             _, values = model.forward(
                 torch.as_tensor(context[0], device=device),
                 torch.as_tensor(context[1], device=device),
                 torch.as_tensor(context[2], device=device),
                 torch.as_tensor(context[3], device=device),
                 torch.as_tensor(context[4], device=device),
-                valid_mask=torch.as_tensor(context[5], device=device),
+                valid_mask=valid_mask_t,
             )
-            mask_t = torch.as_tensor(context[5], device=device)
+            if valid_mask_t is None:
+                return values[:, -1].float().cpu().numpy()
+            mask_t = valid_mask_t
             last_idx = mask_t.long().sum(dim=1).clamp(min=1, max=values.shape[1]) - 1
             rows = torch.arange(values.shape[0], device=device)
             return values[rows, last_idx].float().cpu().numpy()
@@ -825,6 +841,14 @@ def _bootstrap_value(
             torch.as_tensor(episode_start_buf, device=device),
         )
         return next_value.float().cpu().numpy()
+
+
+def _dynamic_sequence_len_enabled(config: Config) -> bool:
+    if config.model == "attention":
+        return False
+    if config.model == "gated_attention" and config.gated_attention_pos == "learned":
+        return False
+    return config.model in SEQUENCE_MODELS
 
 
 def _select_sequence_action(
