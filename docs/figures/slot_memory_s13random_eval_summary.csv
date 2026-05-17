@@ -1,0 +1,4 @@
+run,best_success,first_100_step,best_success_step,last_success,last_step,return_at_best_success,length_at_best_success,commit
+slot_memory_gated_alibi_s13random_seed42,1.000000,2097152,2162688,0.900000,2228224,0.990947,8.500000,46552fb
+lstm_s13random_seed42,0.700000,,unknown,0.333333,12582912,0.691124,unknown,local_runs
+mamba3_s13random_seed42,0.666667,,9306112,0.666667,9306112,0.662335,unknown,local_runs

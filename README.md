@@ -85,6 +85,20 @@ cue head    -> auxiliary cue recall
 --slot-count 0
 ```
 
+## 当前结果快照
+
+当前最好的本地单 seed 结果来自 `slot_memory_gated_alibi_s13random_seed42`：
+
+| 环境 | 模型 | Seed | Eval episodes | First 100% step | Best 100% eval step | Return | Eval length |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `MiniGrid-MemoryS13Random-v0` | GatedAttention + ALiBi + slot memory | 42 | 30 | 2,097,152 | **2,162,688** | **0.991** | 8.5 |
+
+![GatedAttention + ALiBi slot-memory evaluation curves](docs/figures/slot_memory_s13random_eval_curves.png)
+
+曲线摘要 CSV：[`docs/figures/slot_memory_s13random_eval_summary.csv`](docs/figures/slot_memory_s13random_eval_summary.csv)
+
+这是一个很强的单 seed 本地结果，并且已经在本仓库的 masked-action PPO 配置下解决当前 S13Random 设置。这里不直接标成正式 SOTA，因为 MiniGrid Memory 没有一个统一公开 leaderboard 来对齐 wrapper、动作 mask、seed 数和训练预算。
+
 ## 可用模型
 
 | 模型 | `--model` | 建议定位 |
@@ -438,4 +452,3 @@ scripts/run_slot_memory_ablation.ps1  slot-memory 消融脚本
 scripts/train_overnight_mamba.ps1   Windows overnight 训练脚本
 tests/                              单元测试和 smoke 测试
 ```
-
