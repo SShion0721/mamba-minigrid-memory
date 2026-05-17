@@ -175,6 +175,7 @@ micromamba run -n mamba_env python src\train_mamba_ppo.py `
     --mamba-layers 2 `
     --lr 1e-4 `
     --amp bf16 `
+    --no-stateful-rollout `
     --run-name slot_memory_mamba3_s13random_seed42
 ```
 

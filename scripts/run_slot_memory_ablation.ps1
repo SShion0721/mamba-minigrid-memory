@@ -61,7 +61,7 @@ $StructureVariants = @(
 
 function ModelArgs([string]$ModelName) {
     if ($ModelName -eq "mamba3") {
-        return @("--model", "mamba", "--mamba-variant", "mamba3")
+        return @("--model", "mamba", "--mamba-variant", "mamba3", "--no-stateful-rollout")
     }
     if ($ModelName -eq "mamba2") {
         return @("--model", "mamba", "--mamba-variant", "mamba2")

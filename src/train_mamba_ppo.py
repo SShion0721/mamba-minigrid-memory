@@ -266,8 +266,10 @@ def train(config: Config) -> None:
     initial_global_step = global_step
     next_eval = _next_interval_boundary(global_step, config.eval_interval)
     next_save = _next_interval_boundary(global_step, config.save_interval)
+    mamba_stateful_supported = not (config.model == "mamba" and config.mamba_variant == "mamba3")
     use_stateful_rollout = (
         config.stateful_rollout
+        and mamba_stateful_supported
         and config.model in {"mamba", "gated_attention"}
         and (config.model != "gated_attention" or config.gated_attention_pos in {"none", "alibi"})
         and hasattr(model, "init_inference_state")
