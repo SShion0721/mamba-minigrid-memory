@@ -120,6 +120,7 @@ class Config:
     progress_bar: bool = True
     run_name: str = ""
     resume_from: str = ""
+    transfer_from: str = ""
 
 
 def train(config: Config) -> None:
@@ -153,11 +154,17 @@ def train(config: Config) -> None:
     writer.add_text("config", _format_config(config), 0)
 
     global_step = 0
+    ckpt = None
+    if config.resume_from and config.transfer_from:
+        raise ValueError("Use only one of --resume-from or --transfer-from.")
     if config.resume_from:
         ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)
         global_step = int(ckpt.get("global_step", 0))
         print(f"Resumed checkpoint {config.resume_from} at global_step={global_step}")
         _apply_checkpoint_arch_config(config, ckpt)
+    elif config.transfer_from:
+        ckpt = torch.load(config.transfer_from, map_location=device, weights_only=False)
+        print(f"Transferred model weights from {config.transfer_from}; optimizer, scheduler, env, and global_step were not restored.")
 
     envs = [
         make_env(
@@ -174,7 +181,7 @@ def train(config: Config) -> None:
     action_dim = envs[0].action_space.n
 
     model = build_actor_critic(config, action_dim=action_dim).to(device)
-    if config.resume_from:
+    if config.resume_from or config.transfer_from:
         missing, unexpected = model.load_state_dict(
             ckpt["model_state_dict"],
             strict=not config.allow_legacy_load,
@@ -1385,6 +1392,12 @@ def parse_args(default_model: str = "mamba") -> Config:
     parser.set_defaults(progress_bar=True)
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--resume-from", type=str, default="")
+    parser.add_argument(
+        "--transfer-from",
+        type=str,
+        default="",
+        help="Initialize model weights from a checkpoint without restoring env, global step, optimizer, or scheduler.",
+    )
     args = parser.parse_args()
 
     return Config(
@@ -1458,6 +1471,7 @@ def parse_args(default_model: str = "mamba") -> Config:
         progress_bar=args.progress_bar,
         run_name=args.run_name,
         resume_from=args.resume_from,
+        transfer_from=args.transfer_from,
     )
 
 

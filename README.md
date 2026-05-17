@@ -224,6 +224,58 @@ S11 -> S13 -> S13Random -> S17Random
 --curriculum-patience 3
 ```
 
+### 6. 从 S13Random 迁移到 S17Random
+
+如果 S13Random 已经学到稳定策略，可以用 `--transfer-from` 把模型权重迁移到 S17Random。它不同于 `--resume-from`：只加载模型参数，不恢复旧环境、global step、optimizer 或 scheduler。
+
+```powershell
+micromamba run -n mamba_env python src\train_mamba_ppo.py `
+    --model gated_attention `
+    --gated-attention-pos alibi `
+    --env-id MiniGrid-MemoryS17Random-v0 `
+    --total-steps 30000000 `
+    --num-envs 256 `
+    --num-steps 256 `
+    --context-len 256 `
+    --chunk-len 256 `
+    --batch-chunks 64 `
+    --d-model 128 `
+    --spatial-encoder hybrid `
+    --spatial-layers 2 `
+    --spatial-heads 4 `
+    --attention-layers 2 `
+    --attention-heads 8 `
+    --slot-count 4 `
+    --slot-extractor iterative `
+    --slot-iters 3 `
+    --slot-mlp-ratio 2.0 `
+    --temporal-token-mode fuse `
+    --memory-kind episodic_cue `
+    --memory-slots 16 `
+    --memory-topk 4 `
+    --memory-write-window 12 `
+    --aux-recall-coef 0.05 `
+    --valid-actions 0,1,2 `
+    --lr 1.0e-4 `
+    --ent-coef 0.01 `
+    --ent-coef-final 0.001 `
+    --vf-coef 0.5 `
+    --max-grad-norm 0.5 `
+    --n-epochs 4 `
+    --eval-interval 100000 `
+    --eval-episodes 30 `
+    --save-interval 250000 `
+    --log-interval 5 `
+    --spinning-penalty 0.1 `
+    --spinning-threshold 4 `
+    --amp bf16 `
+    --transfer-from runs\slot_memory_gated_alibi_s13random_seed42\model_2162688.pt `
+    --run-name slot_memory_gated_alibi_s17random_from_s13_seed42 `
+    --no-progress-bar
+```
+
+迁移时建议先用较小学习率（如 `1e-4`）微调；如果 success 长时间不动，再回到 `2.5e-4` 或改用 curriculum。
+
 ## 消融实验
 
 一键生成结构消融命令：
