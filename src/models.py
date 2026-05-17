@@ -334,6 +334,29 @@ class EpisodicCueMemory(nn.Module):
         state["age"][done_mask] = 0
         state["episode_cue"][done_mask] = CUE_IGNORE_INDEX
 
+    @staticmethod
+    def _reset_state_copy(
+        state: dict[str, torch.Tensor],
+        done_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if done_mask.numel() == 0 or not done_mask.any():
+            return state
+        next_state = dict(state)
+        for key in ("keys", "vals", "valid"):
+            value = state[key].clone()
+            value[done_mask] = 0
+            next_state[key] = value
+        ptr = state["ptr"].clone()
+        age = state["age"].clone()
+        episode_cue = state["episode_cue"].clone()
+        ptr[done_mask] = 0
+        age[done_mask] = 0
+        episode_cue[done_mask] = CUE_IGNORE_INDEX
+        next_state["ptr"] = ptr
+        next_state["age"] = age
+        next_state["episode_cue"] = episode_cue
+        return next_state
+
     def forward(
         self,
         step_tokens: torch.Tensor,
@@ -386,7 +409,7 @@ class EpisodicCueMemory(nn.Module):
                 dtype=step_token.dtype,
             )
         episode_start = episode_start.reshape(step_token.shape[0], -1)[:, 0].to(device=step_token.device) > 0.5
-        self.reset_state(state, episode_start)
+        state = self._reset_state_copy(state, episode_start)
         if valid is None:
             valid = torch.ones(step_token.shape[0], device=step_token.device, dtype=torch.bool)
         else:
@@ -402,8 +425,9 @@ class EpisodicCueMemory(nn.Module):
         write_mask = valid & has_new_cue & in_write_window
         write_rate = write_mask.float().mean()
         if write_mask.any():
+            state = dict(state)
             state["episode_cue"] = torch.where(write_mask, current_target, state["episode_cue"])
-            self._write(state, step_token, current_target, write_mask)
+            state = self._write(state, step_token, current_target, write_mask)
         state["age"] = torch.where(valid, state["age"] + 1, state["age"])
         if not (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
             self.last_gate_mean = float(gate.mean().detach().cpu())
@@ -436,17 +460,27 @@ class EpisodicCueMemory(nn.Module):
         query: torch.Tensor,
         cue_target: torch.Tensor,
         write_mask: torch.Tensor,
-    ) -> None:
+    ) -> dict[str, torch.Tensor]:
         rows = torch.nonzero(write_mask, as_tuple=False).squeeze(-1)
         if rows.numel() == 0:
-            return
+            return state
         ptr = state["ptr"][rows]
         key = F.normalize(self.key_proj(query.detach()), dim=-1)
         value = self.value_emb(cue_target.clamp(min=0, max=CUE_CLASS_COUNT - 1))
-        state["keys"][rows, ptr] = key[rows].to(dtype=state["keys"].dtype)
-        state["vals"][rows, ptr] = value[rows].to(dtype=state["vals"].dtype)
-        state["valid"][rows, ptr] = True
-        state["ptr"][rows] = (ptr + 1) % self.memory_slots
+        next_state = dict(state)
+        keys = state["keys"].clone()
+        vals = state["vals"].clone()
+        valid = state["valid"].clone()
+        ptr_state = state["ptr"].clone()
+        keys[rows, ptr] = key[rows].to(dtype=keys.dtype)
+        vals[rows, ptr] = value[rows].to(dtype=vals.dtype)
+        valid[rows, ptr] = True
+        ptr_state[rows] = (ptr + 1) % self.memory_slots
+        next_state["keys"] = keys
+        next_state["vals"] = vals
+        next_state["valid"] = valid
+        next_state["ptr"] = ptr_state
+        return next_state
 
 
 class TokenEncoder(nn.Module):

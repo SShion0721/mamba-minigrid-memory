@@ -154,6 +154,35 @@ def test_memory_diagnostics_expose_gate_entropy_and_write_rate():
     assert diagnostics["write_rate"] > 0.0
 
 
+def test_episodic_memory_backward_has_no_inplace_version_error():
+    obs, direction, prev_action, prev_reward, episode_start, valid_mask = _sequence_inputs(batch=2, seq_len=6)
+    model = FastGatedAttentionActorCritic(
+        action_dim=7,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        context_len=6,
+        position_mode="alibi",
+        slot_count=2,
+        slot_extractor="iterative",
+        temporal_token_mode="fuse",
+        memory_kind="episodic_cue",
+        aux_recall=True,
+    )
+    logits, values, aux_logits = model(
+        obs,
+        direction,
+        prev_action,
+        prev_reward,
+        episode_start,
+        valid_mask=valid_mask,
+        return_aux=True,
+    )
+    loss = logits.square().mean() + values.square().mean() + aux_logits.square().mean()
+    loss.backward()
+    assert any(param.grad is not None for param in model.parameters())
+
+
 def test_flatten_and_fuse_modes_preserve_policy_shapes():
     obs, direction, prev_action, prev_reward, episode_start, valid_mask = _sequence_inputs(batch=1, seq_len=4)
     for mode, expected_tokens in [("flatten", 3), ("fuse", 1)]:
