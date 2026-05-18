@@ -1,0 +1,3 @@
+run,best_success,first_100_step,best_success_step,last_success,last_step,return_at_best_success,length_at_best_success,commit
+slot_memory_gated_alibi_s17random_seed42,1.000000,2949120,3276800,1.000000,4915200,0.993709,10.100000,46552fb
+slot_memory_attention_s17random_seed42,0.000000,,65536,0.000000,65536,-143.643326,1445.000000,46552fb

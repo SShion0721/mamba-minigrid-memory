@@ -87,17 +87,22 @@ cue head    -> auxiliary cue recall
 
 ## 当前结果快照
 
-当前最好的本地单 seed 结果来自 `slot_memory_gated_alibi_s13random_seed42`：
+当前最好的本地单 seed 结果来自 GatedAttention + ALiBi + slot memory：
 
-| 环境 | 模型 | Seed | Eval episodes | First 100% step | Best 100% eval step | Return | Eval length |
+| 环境 | Run | Seed | Eval episodes | First 100% step | Best 100% eval step | Return | Eval length |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `MiniGrid-MemoryS13Random-v0` | GatedAttention + ALiBi + slot memory | 42 | 30 | 2,097,152 | **2,162,688** | **0.991** | 8.5 |
+| `MiniGrid-MemoryS13Random-v0` | `slot_memory_gated_alibi_s13random_seed42` | 42 | 30 | 2,097,152 | **2,162,688** | **0.991** | 8.5 |
+| `MiniGrid-MemoryS17Random-v0` | `slot_memory_gated_alibi_s17random_seed42` | 42 | 30 | 2,949,120 | **3,276,800** | **0.994** | 10.1 |
 
 ![GatedAttention + ALiBi slot-memory evaluation curves](docs/figures/slot_memory_s13random_eval_curves.png)
 
-曲线摘要 CSV：[`docs/figures/slot_memory_s13random_eval_summary.csv`](docs/figures/slot_memory_s13random_eval_summary.csv)
+![GatedAttention + ALiBi slot-memory S17Random evaluation curves](docs/figures/slot_memory_s17random_eval_curves.png)
 
-这是一个很强的单 seed 本地结果，并且已经在本仓库的 masked-action PPO 配置下解决当前 S13Random 设置。这里不直接标成正式 SOTA，因为 MiniGrid Memory 没有一个统一公开 leaderboard 来对齐 wrapper、动作 mask、seed 数和训练预算。
+曲线摘要 CSV：
+[`S13Random`](docs/figures/slot_memory_s13random_eval_summary.csv)、
+[`S17Random`](docs/figures/slot_memory_s17random_eval_summary.csv)
+
+这是很强的单 seed 本地结果，并且已经在本仓库的 masked-action PPO 配置下解决当前 S13Random 和 S17Random 设置。这里不直接标成正式 SOTA，因为 MiniGrid Memory 没有一个统一公开 leaderboard 来对齐 wrapper、动作 mask、seed 数和训练预算。
 
 ## 可用模型
 
